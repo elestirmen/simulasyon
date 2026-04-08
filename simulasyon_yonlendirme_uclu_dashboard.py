@@ -85,6 +85,7 @@ class SimulationConfig:
     initial_row: int = 2500
     initial_col: int = 2500
     random_start: bool = True
+    random_start_middle_band_ratio: float = 0.50
     step_size: int = 250
     initial_heading_degrees: float = 0.0
     rotation_step_degrees: float = 15.0
@@ -1021,6 +1022,23 @@ def clamp_observation_cursor(
     clamped_row = min(max(row, minimum), maximum_row)
     clamped_col = min(max(col, minimum), maximum_col)
     return clamped_row, clamped_col
+
+
+def sample_center_biased_coordinate(
+    minimum: int,
+    maximum: int,
+    band_ratio: float,
+) -> int:
+    if maximum <= minimum:
+        return int(minimum)
+
+    center = (minimum + maximum) / 2.0
+    half_span = (maximum - minimum) * max(0.05, min(1.0, float(band_ratio))) / 2.0
+    band_min = max(minimum, int(round(center - half_span)))
+    band_max = min(maximum, int(round(center + half_span)))
+    if band_max <= band_min:
+        return int(round(center))
+    return random.randint(band_min, band_max)
 
 
 def get_observation_boxes(
@@ -2831,8 +2849,16 @@ def choose_initial_cursor(
         config,
     )
     return (
-        random.randint(minimum, maximum_row),
-        random.randint(minimum, maximum_col),
+        sample_center_biased_coordinate(
+            minimum,
+            maximum_row,
+            config.random_start_middle_band_ratio,
+        ),
+        sample_center_biased_coordinate(
+            minimum,
+            maximum_col,
+            config.random_start_middle_band_ratio,
+        ),
     )
 
 

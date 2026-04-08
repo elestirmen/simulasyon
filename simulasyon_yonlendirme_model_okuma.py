@@ -27,9 +27,9 @@ RIGHT_KEYS = (ord("d"), ord("D"), 83, 2555904, 65363)
 
 @dataclass(frozen=True)
 class SimulationConfig:
-    reference_map_path: Path = Path("haritalar/bern_gmap.jpg")
-    observation_map_path: Path = Path("parcalar/bern_gmaps_level_18.tif")
-    model_path: Path = Path("model.h5")
+    reference_map_path: Path = Path("haritalar/ana_harita_urgup_30_cm__GPU_model_f32_k3_epoch_00001_sigmoid_(1_ 1)_06_10_2022_.h5.jpg_resized.jpg_geo.tif_geo.tif_r.tif")
+    observation_map_path: Path = Path("parcalar/urgup_bingmap_utm_30_cm.tif")
+    model_path: Path = Path("GPU_model_f32_k3_epoch_00001_sigmoid_(1_ 1)_06_10_2022_.h5")
     initial_row: int = 2000
     initial_col: int = 2000
     sample_window_size: int = 576
