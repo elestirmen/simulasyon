@@ -109,6 +109,7 @@ class SimulationConfig:
     max_search_window_size: int = 5000
     search_window_growth_step: int = 100
     search_window_failure_growth: int = 500
+    triplet_alignment_tolerance_px: float = 45.0
     global_refresh_interval: int = 0
     dashboard_background_color: Tuple[int, int, int] = (18, 18, 24)
     panel_background_color: Tuple[int, int, int] = (32, 36, 42)
@@ -148,6 +149,8 @@ class SimulationConfig:
     show_observation_boxes: bool = True
     reference_viewport_base_size: int = 6000
     reference_viewport_padding: int = 600
+    reference_viewport_search_padding: int = 320
+    reference_viewport_search_min_size: int = 4200
     diagnostic_benchmark_enabled: bool = False
     diagnostic_benchmark_only: bool = False
     diagnostic_output_dir: Path = Path("diagnostics")
@@ -1487,6 +1490,48 @@ def compute_error_pixels(
     )
 
 
+def is_strict_triplet_alignment(
+    matched_boxes: List[Tuple[int, int, int, int]],
+    intersection_mode: str,
+    config: SimulationConfig,
+) -> bool:
+    if intersection_mode != "abc" or len(matched_boxes) != 3:
+        return False
+
+    center_a = get_box_center(matched_boxes[0])
+    center_b = get_box_center(matched_boxes[1])
+    center_c = get_box_center(matched_boxes[2])
+
+    delta_ab_x = float(center_b[0] - center_a[0])
+    delta_ab_y = float(center_b[1] - center_a[1])
+    delta_bc_x = float(center_c[0] - center_b[0])
+    delta_bc_y = float(center_c[1] - center_b[1])
+    midpoint_x = (center_a[0] + center_c[0]) / 2.0
+    midpoint_y = (center_a[1] + center_c[1]) / 2.0
+    midpoint_error = math.hypot(center_b[0] - midpoint_x, center_b[1] - midpoint_y)
+    expected_offset = float(config.template_offset)
+    step_error = max(
+        abs(delta_ab_x - expected_offset),
+        abs(delta_ab_y - expected_offset),
+        abs(delta_bc_x - expected_offset),
+        abs(delta_bc_y - expected_offset),
+    )
+    symmetry_error = max(
+        abs(delta_ab_x - delta_bc_x),
+        abs(delta_ab_y - delta_bc_y),
+    )
+    monotonic_diagonal = (
+        delta_ab_x > 0.0
+        and delta_ab_y > 0.0
+        and delta_bc_x > 0.0
+        and delta_bc_y > 0.0
+    )
+    alignment_error = max(midpoint_error, step_error, symmetry_error)
+    return monotonic_diagonal and (
+        alignment_error <= float(config.triplet_alignment_tolerance_px)
+    )
+
+
 def ensure_bgr(image: np.ndarray) -> np.ndarray:
     if len(image.shape) == 2:
         return cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
@@ -1633,19 +1678,38 @@ def get_reference_viewport_box(
     config: SimulationConfig,
 ) -> Tuple[int, int, int, int]:
     map_height, map_width = reference_map_shape
+    if search_mode != "global":
+        padding = int(config.reference_viewport_search_padding)
+        search_width = int(search_window_box[2] - search_window_box[0])
+        search_height = int(search_window_box[3] - search_window_box[1])
+        viewport_width = min(
+            map_width,
+            max(
+                int(config.reference_viewport_search_min_size),
+                search_width + (2 * padding),
+            ),
+        )
+        viewport_height = min(
+            map_height,
+            max(
+                int(config.reference_viewport_search_min_size),
+                search_height + (2 * padding),
+            ),
+        )
+        center_x = (search_window_box[0] + search_window_box[2]) / 2.0
+        center_y = (search_window_box[1] + search_window_box[3]) / 2.0
+        viewport_left = int(round(center_x - (viewport_width / 2.0)))
+        viewport_top = int(round(center_y - (viewport_height / 2.0)))
+        viewport_left = min(max(viewport_left, 0), max(0, map_width - viewport_width))
+        viewport_top = min(max(viewport_top, 0), max(0, map_height - viewport_height))
+        viewport_right = viewport_left + viewport_width
+        viewport_bottom = viewport_top + viewport_height
+        return viewport_left, viewport_top, viewport_right, viewport_bottom
+
     relevant_boxes = [
         predicted_intersection_box,
         actual_intersection_box,
     ]
-    if search_mode != "global":
-        relevant_boxes.append(
-            (
-                search_window_box[0],
-                search_window_box[1],
-                search_window_box[2] - search_window_box[0],
-                search_window_box[3] - search_window_box[1],
-            )
-        )
     left = min(box[0] for box in relevant_boxes)
     top = min(box[1] for box in relevant_boxes)
     right = max(box[0] + box[2] for box in relevant_boxes)
@@ -2780,6 +2844,11 @@ def print_localization_status(
     search_window_size: int,
     config: SimulationConfig,
 ) -> None:
+    strict_triplet_lock = is_strict_triplet_alignment(
+        matched_boxes,
+        intersection_mode,
+        config,
+    )
     print("cursor=(row=%d, col=%d)" % (row, col))
     print(
         "scores=(%.4f, %.4f, %.4f) scenario=%s intersection_mode=%s search=%s backend=%s"
@@ -2810,18 +2879,22 @@ def print_localization_status(
             altitude_state.altitude_agl_m,
             altitude_state.center_gsd_cm_per_px,
         )
-    status_line += " window=%d" % search_window_size
+    status_line += " window=%d lock=%s" % (
+        search_window_size,
+        "strict-triplet" if strict_triplet_lock else "partial",
+    )
     print(status_line)
 
 
 def update_search_window_size(
     current_search_window_size: int,
+    matched_boxes: List[Tuple[int, int, int, int]],
     intersection_mode: str,
     config: SimulationConfig,
 ) -> int:
-    if intersection_mode == "abc":
+    if is_strict_triplet_alignment(matched_boxes, intersection_mode, config):
         return config.base_search_window_size
-    if intersection_mode in ("ab", "bc", "ac"):
+    if intersection_mode in ("abc", "ab", "bc", "ac"):
         return min(
             config.max_search_window_size,
             current_search_window_size + config.search_window_growth_step,
@@ -2954,9 +3027,18 @@ def main() -> None:
             predicted_center = get_box_center(predicted_intersection_box)
             actual_center = get_box_center(actual_intersection_box)
             error_pixels = compute_error_pixels(predicted_center, actual_center)
-            previous_predicted_center = predicted_center
+            strict_triplet_lock = is_strict_triplet_alignment(
+                matched_boxes,
+                intersection_mode,
+                config,
+            )
+            if strict_triplet_lock:
+                previous_predicted_center = predicted_center
+            elif previous_predicted_center is None:
+                previous_predicted_center = search_anchor_center
             search_window_size = update_search_window_size(
                 current_search_window_size,
+                matched_boxes,
                 intersection_mode,
                 config,
             )
