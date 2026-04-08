@@ -1,0 +1,17 @@
+# Varsayilan olarak her seyi ignore et.
+*
+
+# Alt klasorlere inebilmek icin klasorleri serbest birak.
+!*/
+
+# Yalnizca kaynak ve dokuman dosyalarini takip et.
+!.gitignore
+!*.py
+!*.md
+!*.txt
+
+# Uretilmis Python dosyalari her zaman ignore.
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
