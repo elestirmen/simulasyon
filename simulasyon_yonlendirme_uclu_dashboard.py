@@ -70,8 +70,8 @@ class SimulationConfig:
     reference_map_path: Path = Path(
         "haritalar/ana_harita_urgup_30_cm__GPU_model_f32_k3_epoch_00001_sigmoid_(1_ 1)_06_10_2022_.h5.jpg_resized.jpg_geo.tif_geo.tif_r.tif"
     )
-    observation_map_path: Path = Path("parcalar/urgup_bingmap_utm_30_cm.tif")
-    observation_georef_path: Path = Path("parcalar/urgup_bingmap_utm_30_cm.tif")
+    observation_map_path: Path = Path("parcalar/urgup_bingmap_30cm_utm.tif")
+    observation_georef_path: Path = Path("parcalar/urgup_bingmap_30cm_utm.tif")
     observation_grid_georef_path: Optional[Path] = Path(
         "haritalar/ana_harita_urgup_30_cm__GPU_model_f32_k3_epoch_00001_sigmoid_(1_ 1)_06_10_2022_.h5.jpg_resized.jpg_geo.tif_geo.tif_r.tif"
     )
@@ -100,13 +100,14 @@ class SimulationConfig:
     virtual_camera_width_px: int = 544
     align_observation_to_reference_grid: bool = True
     display_size: Tuple[int, int] = (1000, 1000)
+    left_panel_width_ratio: float = 0.38
     match_method: int = cv2.TM_CCOEFF_NORMED
     use_parallel_matching: bool = True
     use_pyramid_matching: bool = True
     coarse_scale: float = 0.5
     roi_pad_factor: float = 0.4
     base_search_window_size: int = 2048
-    max_search_window_size: int = 5000
+    max_search_window_size: int = 15000
     search_window_growth_step: int = 100
     search_window_failure_growth: int = 500
     triplet_alignment_tolerance_px: float = 45.0
@@ -1571,7 +1572,7 @@ def get_dashboard_layout(
     config: SimulationConfig,
 ) -> Tuple[Tuple[int, int, int, int], Tuple[int, int, int, int], Tuple[int, int, int, int]]:
     dashboard_width, dashboard_height = config.display_size
-    left_panel_width = int(dashboard_width * 0.30)
+    left_panel_width = int(dashboard_width * float(config.left_panel_width_ratio))
     map_width = (
         dashboard_width
         - (3 * config.panel_padding)
@@ -2048,32 +2049,24 @@ def create_observation_view(
     ui_state: dict,
     config: SimulationConfig,
 ) -> np.ndarray:
-    context_view = create_observation_context_view(
-        observation_map,
-        observation_boxes,
+    _ = (
         actual_boxes,
         actual_intersection_box,
+        observation_windows,
         heading_degrees,
         ui_state,
-        config,
     )
-    if len(observation_windows) < 3:
-        return context_view
+    if len(observation_boxes) < 3:
+        return np.zeros(
+            (config.sample_window_size, config.sample_window_size, 3),
+            dtype=np.uint8,
+        )
 
     hero_size = config.sample_window_size
-    thumb_size = config.template_strip_tile_size
-    gap = 14
     padding = 16
     title_height = 34
-    canvas_width = max(hero_size, (2 * thumb_size) + gap)
-    context_preview = resize_to_fit(context_view, canvas_width, max(180, hero_size // 2))
-    canvas_height = (
-        (padding * 4)
-        + (title_height * 3)
-        + hero_size
-        + thumb_size
-        + context_preview.shape[0]
-    )
+    canvas_width = hero_size
+    canvas_height = (padding * 2) + title_height + hero_size
     canvas = np.full(
         (canvas_height, canvas_width, 3),
         config.panel_background_color,
@@ -2084,7 +2077,7 @@ def create_observation_view(
     top_y = padding
     cv2.putText(
         canvas,
-        "Model Girdisi - Kuzeye Hizali",
+        "Mavi Pencere - Ham Raster Crop",
         (padding, top_y + 24),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.72,
@@ -2092,69 +2085,15 @@ def create_observation_view(
         2,
     )
     hero_y = top_y + title_height
+    raw_blue_window = extract_padded_patch(observation_map, observation_boxes[2])
     _draw_observation_tile(
         canvas,
-        observation_windows[1],
+        raw_blue_window,
         (center_x, hero_y),
         hero_size,
-        "O2",
-        TEMPLATE_COLORS[1],
-        format_patch_subtitle(1, altitude_state, config),
-    )
-
-    side_title_y = hero_y + hero_size + padding
-    cv2.putText(
-        canvas,
-        "Komsu Pencereler",
-        (padding, side_title_y + 24),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.68,
-        config.panel_title_color,
-        2,
-    )
-    side_y = side_title_y + title_height
-    side_x0 = (canvas_width - ((2 * thumb_size) + gap)) // 2
-    _draw_observation_tile(
-        canvas,
-        observation_windows[0],
-        (side_x0, side_y),
-        thumb_size,
-        "O1",
-        TEMPLATE_COLORS[0],
-        format_patch_subtitle(0, altitude_state, config),
-    )
-    _draw_observation_tile(
-        canvas,
-        observation_windows[2],
-        (side_x0 + thumb_size + gap, side_y),
-        thumb_size,
         "O3",
         TEMPLATE_COLORS[2],
-        format_patch_subtitle(2, altitude_state, config),
-    )
-
-    context_title_y = side_y + thumb_size + padding
-    cv2.putText(
-        canvas,
-        "Ham Baglam",
-        (padding, context_title_y + 24),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.68,
-        config.panel_title_color,
-        2,
-    )
-    context_y = context_title_y + title_height
-    context_x = (canvas_width - context_preview.shape[1]) // 2
-    canvas[
-        context_y : context_y + context_preview.shape[0],
-        context_x : context_x + context_preview.shape[1],
-    ] = context_preview
-    cv2.rectangle(
-        canvas,
-        (context_x, context_y),
-        (context_x + context_preview.shape[1], context_y + context_preview.shape[0]),
-        config.panel_border_color,
-        2,
+        "raw 544x544",
     )
 
     return canvas
@@ -2164,11 +2103,17 @@ def create_template_strip(
     templates: List[np.ndarray],
     config: SimulationConfig,
 ) -> np.ndarray:
-    tile_size = config.template_strip_tile_size
+    if len(templates) < 3:
+        return np.zeros(
+            (config.sample_window_size, config.sample_window_size, 3),
+            dtype=np.uint8,
+        )
+
+    hero_size = config.sample_window_size
     padding = 16
-    label_height = 38
-    strip_width = (padding * 2) + tile_size
-    strip_height = (padding * 2) + tile_size + label_height
+    title_height = 34
+    strip_width = hero_size
+    strip_height = (padding * 2) + title_height + hero_size
 
     strip = np.full(
         (strip_height, strip_width, 3),
@@ -2176,25 +2121,25 @@ def create_template_strip(
         dtype=np.uint8,
     )
 
-    center_template = cv2.resize(
-        ensure_bgr(templates[1]),
-        (tile_size, tile_size),
+    blue_template = cv2.resize(
+        ensure_bgr(templates[2]),
+        (hero_size, hero_size),
         interpolation=cv2.INTER_AREA,
     )
-    tile_x = padding
-    tile_y = padding + label_height
-    strip[tile_y : tile_y + tile_size, tile_x : tile_x + tile_size] = center_template
+    tile_x = (strip_width - hero_size) // 2
+    tile_y = padding + title_height
+    strip[tile_y : tile_y + hero_size, tile_x : tile_x + hero_size] = blue_template
     cv2.rectangle(
         strip,
         (tile_x, tile_y),
-        (tile_x + tile_size, tile_y + tile_size),
-        config.panel_border_color,
+        (tile_x + hero_size, tile_y + hero_size),
+        TEMPLATE_COLORS[2],
         2,
     )
     cv2.putText(
         strip,
-        "Merkez Model Ciktisi",
-        (tile_x, padding + 24),
+        "Mavi Pencere - Model Ciktisi",
+        (padding, padding + 24),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.62,
         config.panel_title_color,
