@@ -116,23 +116,12 @@ for k, ana_harita in enumerate(harita_klasoru):
                 #methods = ['cv2.TM_CCOEFF', 'cv2.TM_CCOEFF_NORMED', 'cv2.TM_CCORR',
                 #           'cv2.TM_CCORR_NORMED', 'cv2.TM_SQDIFF', 'cv2.TM_SQDIFF_NORMED']
                 
-                methods =['cv2.TM_CCOEFF']
-                for meth in methods:
-                    method  = eval(meth)    #stringleri fonksiyona çeviren fonksiyona
-                    res= cv2.matchTemplate(harita, template, method, None, template)
+                methods = [cv2.TM_CCOEFF]
+                for method in methods:
+                    res = cv2.matchTemplate(harita, template, method, None, template)
                     print(res.shape)
                     min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(res)
-                    
-                   
-                    
-                    print("skor = __", round(max_val/1000000,2),"__ konum = ", max_loc)
-                    
-                    """
-                    if method in [cv2.TM_SQDIFF,cv2.TM_SQDIFF_NORMED]:
-                        top_left =min_loc
-                    else:
-                        top_left = max_loc
-                    """
+                    print("skor = __", round(max_val/1000000, 2), "__ konum = ", max_loc)
                     top_left = max_loc
                             
                     bottom_right = (top_left[0] + w,top_left[1] + h)

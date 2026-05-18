@@ -9,7 +9,10 @@ Reference map:
     is estimated from the intersection of the matched boxes.
 """
 
+import argparse
 import concurrent.futures
+import csv
+import dataclasses
 import json
 import math
 import os
@@ -17,7 +20,16 @@ import random
 from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import IO, List, Optional, Tuple
+
+from gps_denied_autonomy import (
+    LocalizationQuality,
+    choose_autonomous_action,
+    compute_localization_quality,
+    fuse_measurement_with_prior,
+    propagate_center_with_action,
+    update_waypoint_progress,
+)
 
 os.environ["OPENCV_IO_MAX_IMAGE_PIXELS"] = str(pow(2, 40))
 
@@ -39,6 +51,8 @@ ROTATE_RIGHT_KEYS = (ord("e"), ord("E"))
 ALTITUDE_UP_KEYS = (ord("+"), ord("="), 43, 61, 107)
 ALTITUDE_DOWN_KEYS = (ord("-"), ord("_"), 45, 95, 109)
 EXIT_KEYS = (27, ord("x"), ord("X"))
+AUTONOMOUS_TOGGLE_KEYS = (ord("p"), ord("P"))
+KALMAN_TOGGLE_KEYS = (ord("k"), ord("K"))
 COMPASS_LABELS = ("K", "KD", "D", "GD", "G", "GB", "B", "KB")
 TEMPLATE_COLORS = (
     (0, 0, 255),
@@ -66,14 +80,14 @@ UI_COLORS = {
 
 @dataclass(frozen=True)
 class SimulationConfig:
-    scenario_mode: str = "irtifa"  # "normal" veya "irtifa"
+    scenario_mode: str = "normal"  # "normal" veya "irtifa"
     reference_map_path: Path = Path(
-        "haritalar/ana_harita_urgup_30_cm__GPU_model_f32_k3_epoch_00001_sigmoid_(1_ 1)_06_10_2022_.h5.jpg_resized.jpg_geo.tif_geo.tif_r.tif"
+        "haritalar/ana_harita_urgup_30_cm__new_GPU_model_f32_k3_epoch_00001_sigmoid_(1_ 1)_06_10_2022.tif"
     )
     observation_map_path: Path = Path("parcalar/urgup_bingmap_30cm_utm.tif")
     observation_georef_path: Path = Path("parcalar/urgup_bingmap_30cm_utm.tif")
     observation_grid_georef_path: Optional[Path] = Path(
-        "haritalar/ana_harita_urgup_30_cm__GPU_model_f32_k3_epoch_00001_sigmoid_(1_ 1)_06_10_2022_.h5.jpg_resized.jpg_geo.tif_geo.tif_r.tif"
+        "haritalar/ana_harita_urgup_30_cm__new_GPU_model_f32_k3_epoch_00001_sigmoid_(1_ 1)_06_10_2022_son_model.h5.jpg_geo.tif_UTM_geo_r.tif"
     )
     dem_path: Path = Path("ana_harita_urgup_30_cm_utm_elevation.tif")
     model_path: Path = Path("GPU_model_f32_k3_epoch_00001_sigmoid_(1_ 1)_06_10_2022_.h5")
@@ -163,6 +177,27 @@ class SimulationConfig:
         (6000, 24000),
         (18000, 12000),
     )
+    # --- Lokalizasyon kalitesi eşikleri ---
+    localization_score_threshold: float = 0.35
+    localization_confidence_threshold: float = 0.40
+    localization_spread_threshold_px: float = 120.0
+    # --- Sensör füzyonu ---
+    sensor_fusion_blend_gain: float = 0.75
+    max_visual_jump_px: float = 600.0
+    # --- Kalman filtresi ---
+    kalman_enabled: bool = False
+    kalman_process_noise: float = 50.0
+    kalman_measurement_noise: float = 80.0
+    # --- CSV adım loglama ---
+    log_csv_enabled: bool = True
+    log_csv_path: Optional[Path] = None
+    # --- Otonom mod ---
+    autonomous_step_interval_ms: int = 400
+    waypoint_acceptance_radius_px: float = 150.0
+    waypoint_rotation_tolerance_deg: float = 15.0
+    waypoint_body_axis_deadband_px: float = 50.0
+    waypoint_required_consecutive_hits: int = 2
+    waypoint_acceptance_confidence_threshold: float = 0.40
 
 
 @dataclass(frozen=True)
@@ -206,6 +241,222 @@ class _CompatConv2DTranspose(Conv2DTranspose):
         compat_config = dict(config or {})
         compat_config.pop("groups", None)
         return super().from_config(compat_config)
+
+
+class PositionKalmanFilter:
+    """Sabit-hız modelli 2D konum Kalman filtresi."""
+
+    def __init__(
+        self,
+        initial_position: Tuple[int, int],
+        process_noise: float = 50.0,
+        measurement_noise: float = 80.0,
+    ) -> None:
+        self._x = float(initial_position[0])
+        self._y = float(initial_position[1])
+        self._var_x = measurement_noise ** 2
+        self._var_y = measurement_noise ** 2
+        self._q = process_noise ** 2
+        self._r = measurement_noise ** 2
+
+    def predict(self, motion_x: float = 0.0, motion_y: float = 0.0) -> None:
+        self._x += motion_x
+        self._y += motion_y
+        self._var_x += self._q
+        self._var_y += self._q
+
+    def update(self, measured_x: float, measured_y: float, confidence: float = 1.0) -> None:
+        r_scaled = self._r / max(0.01, float(confidence))
+        k_x = self._var_x / (self._var_x + r_scaled)
+        k_y = self._var_y / (self._var_y + r_scaled)
+        self._x += k_x * (measured_x - self._x)
+        self._y += k_y * (measured_y - self._y)
+        self._var_x *= max(0.0, 1.0 - k_x)
+        self._var_y *= max(0.0, 1.0 - k_y)
+
+    @property
+    def position(self) -> Tuple[int, int]:
+        return (int(round(self._x)), int(round(self._y)))
+
+    @property
+    def uncertainty_px(self) -> float:
+        return math.sqrt((self._var_x + self._var_y) / 2.0)
+
+
+# ---------------------------------------------------------------------------
+# CSV loglama
+# ---------------------------------------------------------------------------
+
+_CSV_FIELDNAMES = (
+    "adim", "zaman", "row", "col", "baslik_deg", "irtifa_m",
+    "aksiyon", "skor_a", "skor_b", "skor_c",
+    "kesisim_modu", "arama_modu", "match_backend",
+    "gercek_x", "gercek_y", "ham_tahmin_x", "ham_tahmin_y",
+    "kalman_x", "kalman_y",
+    "hata_px", "kalman_hata_px",
+    "hata_m", "kalman_hata_m",
+    "guven", "skor_min", "skor_ort", "yayilma_px",
+    "guvenilir", "guvenilirlik_neden", "arama_pencere_px",
+)
+
+
+def _open_csv_log(
+    config: "SimulationConfig",
+) -> Tuple[Optional[csv.DictWriter], Optional[IO]]:
+    if not config.log_csv_enabled:
+        return None, None
+    log_path = config.log_csv_path
+    if log_path is None:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_path = Path("log_simulasyon_%s.csv" % timestamp)
+    csv_file = open(str(log_path), "w", newline="", encoding="utf-8")
+    writer = csv.DictWriter(csv_file, fieldnames=_CSV_FIELDNAMES)
+    writer.writeheader()
+    return writer, csv_file
+
+
+def _write_csv_row(
+    writer: csv.DictWriter,
+    step_count: int,
+    row: int,
+    col: int,
+    heading_degrees: float,
+    altitude_state: "AltitudeSimulationState",
+    last_action: str,
+    score_values: List[float],
+    intersection_mode: str,
+    search_mode: str,
+    match_backend: str,
+    actual_center: Tuple[int, int],
+    raw_predicted_center: Tuple[int, int],
+    kalman_center: Optional[Tuple[int, int]],
+    actual_center_ref: Tuple[int, int],
+    quality: "LocalizationQuality",
+    search_window_size: int,
+) -> None:
+    kalman_x = kalman_center[0] if kalman_center is not None else ""
+    kalman_y = kalman_center[1] if kalman_center is not None else ""
+    kalman_err = (
+        math.hypot(kalman_center[0] - actual_center_ref[0], kalman_center[1] - actual_center_ref[1])
+        if kalman_center is not None else ""
+    )
+    raw_err = math.hypot(
+        raw_predicted_center[0] - actual_center_ref[0],
+        raw_predicted_center[1] - actual_center_ref[1],
+    )
+    gsd_cm = (
+        altitude_state.center_gsd_cm_per_px
+        if altitude_state.center_gsd_cm_per_px > 0.0
+        else 0.0
+    )
+    raw_err_m = round(raw_err * gsd_cm / 100.0, 2) if gsd_cm > 0.0 else ""
+    kalman_err_m = (
+        round(float(kalman_err) * gsd_cm / 100.0, 2)
+        if (kalman_err != "" and gsd_cm > 0.0) else ""
+    )
+    scores = list(score_values) + [0.0] * max(0, 3 - len(score_values))
+    writer.writerow({
+        "adim": step_count,
+        "zaman": datetime.now().strftime("%H:%M:%S.%f")[:-3],
+        "row": row,
+        "col": col,
+        "baslik_deg": round(heading_degrees, 2),
+        "irtifa_m": round(altitude_state.altitude_agl_m, 1),
+        "aksiyon": last_action,
+        "skor_a": round(scores[0], 5),
+        "skor_b": round(scores[1], 5),
+        "skor_c": round(scores[2], 5),
+        "kesisim_modu": intersection_mode,
+        "arama_modu": search_mode,
+        "match_backend": match_backend,
+        "gercek_x": actual_center[0],
+        "gercek_y": actual_center[1],
+        "ham_tahmin_x": raw_predicted_center[0],
+        "ham_tahmin_y": raw_predicted_center[1],
+        "kalman_x": kalman_x,
+        "kalman_y": kalman_y,
+        "hata_px": round(raw_err, 2),
+        "kalman_hata_px": round(kalman_err, 2) if kalman_err != "" else "",
+        "hata_m": raw_err_m,
+        "kalman_hata_m": kalman_err_m,
+        "guven": round(quality.confidence, 4),
+        "skor_min": round(quality.score_floor, 4),
+        "skor_ort": round(quality.score_mean, 4),
+        "yayilma_px": round(quality.center_spread_px, 2),
+        "guvenilir": int(quality.is_reliable),
+        "guvenilirlik_neden": quality.reason,
+        "arama_pencere_px": search_window_size,
+    })
+
+
+# ---------------------------------------------------------------------------
+# Argparse & config override
+# ---------------------------------------------------------------------------
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Üçlü şablon eşleme lokalizasyon simülasyonu",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("--senaryo", default=None, choices=["normal", "irtifa"],
+                        help="Simülasyon senaryosu")
+    parser.add_argument("--referans", default=None, metavar="YOL",
+                        help="Referans harita dosyası")
+    parser.add_argument("--gozlem", default=None, metavar="YOL",
+                        help="Gözlem harita dosyası")
+    parser.add_argument("--model", default=None, metavar="YOL",
+                        help="Model .h5 dosyası")
+    parser.add_argument("--adim-px", type=int, default=None, metavar="N",
+                        help="Hareket adım büyüklüğü (piksel)")
+    parser.add_argument("--arama-penceresi", type=int, default=None, metavar="N",
+                        help="Başlangıç arama penceresi (piksel)")
+    parser.add_argument("--kalman", action="store_true", default=None,
+                        help="Kalman filtresini aktif et")
+    parser.add_argument("--kalman-yok", dest="kalman", action="store_false",
+                        help="Kalman filtresini devre dışı bırak")
+    parser.add_argument("--csv-yok", action="store_true",
+                        help="CSV loglamayı devre dışı bırak")
+    parser.add_argument("--csv-dosya", default=None, metavar="YOL",
+                        help="CSV log dosyası yolu")
+    parser.add_argument("--otonom-aralik-ms", type=int, default=None, metavar="MS",
+                        help="Otonom mod adım aralığı (ms)")
+    parser.add_argument("--rastgele-baslangic", action="store_true", default=None,
+                        help="Rastgele başlangıç konumu kullan")
+    parser.add_argument("--sabit-baslangic", dest="rastgele_baslangic", action="store_false",
+                        help="Sabit başlangıç konumu kullan")
+    return parser.parse_args()
+
+
+def _apply_args_to_config(
+    config: "SimulationConfig",
+    args: argparse.Namespace,
+) -> "SimulationConfig":
+    overrides = {}
+    if args.senaryo is not None:
+        overrides["scenario_mode"] = args.senaryo
+    if args.referans is not None:
+        overrides["reference_map_path"] = Path(args.referans)
+    if args.gozlem is not None:
+        overrides["observation_map_path"] = Path(args.gozlem)
+    if args.model is not None:
+        overrides["model_path"] = Path(args.model)
+    if args.adim_px is not None:
+        overrides["step_size"] = args.adim_px
+    if args.arama_penceresi is not None:
+        overrides["base_search_window_size"] = args.arama_penceresi
+    if args.kalman is not None:
+        overrides["kalman_enabled"] = args.kalman
+    if args.csv_yok:
+        overrides["log_csv_enabled"] = False
+    if args.csv_dosya is not None:
+        overrides["log_csv_path"] = Path(args.csv_dosya)
+    if args.otonom_aralik_ms is not None:
+        overrides["autonomous_step_interval_ms"] = args.otonom_aralik_ms
+    if args.rastgele_baslangic is not None:
+        overrides["random_start"] = args.rastgele_baslangic
+    if not overrides:
+        return config
+    return dataclasses.replace(config, **overrides)
 
 
 def load_grayscale_image(path: Path) -> np.ndarray:
@@ -455,17 +706,23 @@ def compute_scale_factor_for_altitude(
     )
 
 
-def build_normal_altitude_state(patch_count: int) -> AltitudeSimulationState:
+def build_normal_altitude_state(
+    patch_count: int,
+    config: SimulationConfig,
+    altitude_agl_m: float = 0.0,
+) -> AltitudeSimulationState:
+    # Normal modda observation_map referans harita ile aynı GSD'de (scale=1.0).
+    # İrtifa sadece gösterim için saklanır; eşleşme ölçeğini etkilemez.
     zero_tuple = tuple(0.0 for _ in range(patch_count))
     scale_tuple = tuple(1.0 for _ in range(patch_count))
     return AltitudeSimulationState(
-        altitude_agl_m=0.0,
-        altitude_msl_m=0.0,
+        altitude_agl_m=float(altitude_agl_m),
+        altitude_msl_m=float(altitude_agl_m),
         center_ground_elevation_m=0.0,
         patch_ground_elevations_m=zero_tuple,
-        patch_agl_m=zero_tuple,
+        patch_agl_m=tuple(altitude_agl_m for _ in range(patch_count)),
         patch_scale_factors=scale_tuple,
-        center_gsd_cm_per_px=0.0,
+        center_gsd_cm_per_px=float(config.reference_map_gsd_cm_per_px),
     )
 
 
@@ -782,6 +1039,8 @@ def draw_info_panel(
 def _build_runtime_buttons() -> List[dict]:
     return [
         {"key": "_panel_collapsed", "label": "", "hotkey": "H", "rect": (0, 0, 0, 0), "is_collapse": True},
+        {"key": "autonomous_mode", "label": "Otonom Mod", "hotkey": "P", "rect": (0, 0, 0, 0)},
+        {"key": "kalman_on", "label": "Kalman", "hotkey": "K", "rect": (0, 0, 0, 0)},
         {"key": "info_panel", "label": "Bilgi", "hotkey": "B", "rect": (0, 0, 0, 0)},
         {"key": "trajectory", "label": "Trajektori", "hotkey": "T", "rect": (0, 0, 0, 0)},
         {"key": "roi_frame", "label": "ROI Cerceve", "hotkey": "O", "rect": (0, 0, 0, 0)},
@@ -936,13 +1195,30 @@ def _runtime_buttons_mouse_cb(event: int, x: int, y: int, flags: int, userdata: 
     if event != cv2.EVENT_LBUTTONDOWN:
         return
 
+    # Önce buton tıklamalarını kontrol et
     for button in buttons:
         bx, by, bw, bh = button.get("rect", (0, 0, 0, 0))
         if bx <= x <= (bx + bw) and by <= y <= (by + bh):
             key = button.get("key")
             ui_state[key] = not bool(ui_state.get(key, False))
             ui_state["_dirty"] = True
-            break
+            return
+
+    # Otonom modda harita paneline tıklama → waypoint ayarla
+    if not ui_state.get("autonomous_mode", False):
+        return
+    preview_state = userdata.get("reference_preview_state")
+    if preview_state is None:
+        return
+    px0 = preview_state.paste_x
+    py0 = preview_state.paste_y
+    px1 = px0 + preview_state.preview_width
+    py1 = py0 + preview_state.preview_height
+    if px0 <= x <= px1 and py0 <= y <= py1:
+        ref_x = (x - px0) / preview_state.scale_x + preview_state.viewport_left
+        ref_y = (y - py0) / preview_state.scale_y + preview_state.viewport_top
+        userdata["waypoint_target"] = (int(round(ref_x)), int(round(ref_y)))
+        ui_state["_dirty"] = True
 
 
 def create_runtime_ui_state(config: SimulationConfig) -> dict:
@@ -953,9 +1229,12 @@ def create_runtime_ui_state(config: SimulationConfig) -> dict:
         "tm_boxes": bool(config.show_tm_boxes),
         "heading_arrow": bool(config.show_heading_arrow),
         "observation_boxes": bool(config.show_observation_boxes),
+        "autonomous_mode": False,
+        "kalman_on": bool(config.kalman_enabled),
         "_panel_collapsed": True,
         "_hover_key": None,
         "_dirty": True,
+        "_quality": None,
     }
 
 
@@ -975,6 +1254,10 @@ def apply_runtime_ui_hotkey(key: int, ui_state: dict) -> bool:
         ord("G"): "observation_boxes",
         ord("h"): "_panel_collapsed",
         ord("H"): "_panel_collapsed",
+        ord("p"): "autonomous_mode",
+        ord("P"): "autonomous_mode",
+        ord("k"): "kalman_on",
+        ord("K"): "kalman_on",
     }
     target = hotkey_map.get(key)
     if target is None:
@@ -1143,10 +1426,15 @@ def extract_rotated_observation_window(
         )
 
     if scaled_window_size != config.sample_window_size:
+        interp = (
+            cv2.INTER_AREA
+            if scaled_window_size > config.sample_window_size
+            else cv2.INTER_LINEAR
+        )
         scaled_window = cv2.resize(
             scaled_window,
             (config.sample_window_size, config.sample_window_size),
-            interpolation=cv2.INTER_NEAREST,
+            interpolation=interp,
         )
 
     return scaled_window
@@ -1227,7 +1515,7 @@ def extract_template_triplet(
             config,
         )
     else:
-        altitude_state = build_normal_altitude_state(len(observation_boxes))
+        altitude_state = build_normal_altitude_state(len(observation_boxes), config, altitude_agl_m)
 
     observation_windows = []
     for box, scale_factor in zip(
@@ -1414,10 +1702,26 @@ def get_search_window_box(
     half_window = max(1, int(window_size // 2))
     center_x, center_y = center
 
-    left = max(0, center_x - half_window)
-    top = max(0, center_y - half_window)
-    right = min(width, center_x + half_window)
-    bottom = min(height, center_y + half_window)
+    left = center_x - half_window
+    right = center_x + half_window
+    top = center_y - half_window
+    bottom = center_y + half_window
+
+    # Kenar taşması olduğunda karşı tarafı genişlet — merkez hizası korunur
+    if left < 0:
+        right -= left
+        left = 0
+    if right > width:
+        left -= right - width
+        right = width
+        left = max(0, left)
+    if top < 0:
+        bottom -= top
+        top = 0
+    if bottom > height:
+        top -= bottom - height
+        bottom = height
+        top = max(0, top)
 
     return left, top, right, bottom
 
@@ -1683,11 +1987,27 @@ def get_reference_viewport_box(
         padding = int(config.reference_viewport_search_padding)
         search_width = int(search_window_box[2] - search_window_box[0])
         search_height = int(search_window_box[3] - search_window_box[1])
+
+        # Gerçek konum her zaman görünür olsun: arama penceresi + actual box'u kapsayan bb
+        all_x = [
+            search_window_box[0], search_window_box[2],
+            actual_intersection_box[0],
+            actual_intersection_box[0] + actual_intersection_box[2],
+        ]
+        all_y = [
+            search_window_box[1], search_window_box[3],
+            actual_intersection_box[1],
+            actual_intersection_box[1] + actual_intersection_box[3],
+        ]
+        span_x = int(max(all_x) - min(all_x))
+        span_y = int(max(all_y) - min(all_y))
+
         viewport_width = min(
             map_width,
             max(
                 int(config.reference_viewport_search_min_size),
                 search_width + (2 * padding),
+                span_x + (2 * padding),
             ),
         )
         viewport_height = min(
@@ -1695,10 +2015,11 @@ def get_reference_viewport_box(
             max(
                 int(config.reference_viewport_search_min_size),
                 search_height + (2 * padding),
+                span_y + (2 * padding),
             ),
         )
-        center_x = (search_window_box[0] + search_window_box[2]) / 2.0
-        center_y = (search_window_box[1] + search_window_box[3]) / 2.0
+        center_x = (min(all_x) + max(all_x)) / 2.0
+        center_y = (min(all_y) + max(all_y)) / 2.0
         viewport_left = int(round(center_x - (viewport_width / 2.0)))
         viewport_top = int(round(center_y - (viewport_height / 2.0)))
         viewport_left = min(max(viewport_left, 0), max(0, map_width - viewport_width))
@@ -2419,6 +2740,68 @@ def run_template_diagnostics(
     return output_dir
 
 
+def _draw_score_bars(
+    canvas: np.ndarray,
+    score_values: List[float],
+    x: int,
+    y: int,
+    bar_w: int = 80,
+    bar_h: int = 10,
+    gap: int = 4,
+) -> None:
+    """Her template için normalize edilmiş skor çubuğu çizer."""
+    for idx, raw_score in enumerate(score_values[:3]):
+        # TM_CCOEFF_NORMED: [-1, 1] → [0, 1]
+        norm = max(0.0, min(1.0, (float(raw_score) + 1.0) / 2.0))
+        color_r = int(255 * (1.0 - norm))
+        color_g = int(255 * norm)
+        bar_y = y + idx * (bar_h + gap)
+        cv2.rectangle(canvas, (x, bar_y), (x + bar_w, bar_y + bar_h), (50, 50, 60), -1)
+        fill_w = max(1, int(round(bar_w * norm)))
+        cv2.rectangle(canvas, (x, bar_y), (x + fill_w, bar_y + bar_h), (0, color_g, color_r), -1)
+        cv2.rectangle(canvas, (x, bar_y), (x + bar_w, bar_y + bar_h), (80, 80, 90), 1)
+        cv2.putText(
+            canvas,
+            "T%d %.3f" % (idx + 1, raw_score),
+            (x + bar_w + 6, bar_y + bar_h - 1),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.40,
+            TEMPLATE_COLORS[idx],
+            1,
+            cv2.LINE_AA,
+        )
+
+
+def _draw_confidence_bar(
+    canvas: np.ndarray,
+    confidence: float,
+    is_reliable: bool,
+    x: int,
+    y: int,
+    bar_w: int = 120,
+    bar_h: int = 14,
+) -> None:
+    conf = max(0.0, min(1.0, confidence))
+    r = int(255 * (1.0 - conf))
+    g = int(255 * conf)
+    border_color = (0, 200, 80) if is_reliable else (0, 80, 220)
+    cv2.rectangle(canvas, (x, y), (x + bar_w, y + bar_h), (40, 40, 50), -1)
+    fill_w = max(1, int(round(bar_w * conf)))
+    cv2.rectangle(canvas, (x, y), (x + fill_w, y + bar_h), (0, g, r), -1)
+    cv2.rectangle(canvas, (x, y), (x + bar_w, y + bar_h), border_color, 1)
+    label = "TAMAM" if is_reliable else "DUSUK"
+    cv2.putText(
+        canvas,
+        "%.2f %s" % (conf, label),
+        (x + bar_w + 6, y + bar_h - 1),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.45,
+        border_color,
+        1,
+        cv2.LINE_AA,
+    )
+
+
 def draw_hud(
     canvas: np.ndarray,
     map_rect: Tuple[int, int, int, int],
@@ -2427,6 +2810,7 @@ def draw_hud(
     predicted_center: Tuple[int, int],
     actual_center: Tuple[int, int],
     error_pixels: float,
+    kalman_error_pixels: Optional[float],
     step_count: int,
     last_action: str,
     heading_degrees: float,
@@ -2437,31 +2821,82 @@ def draw_hud(
     search_window_size: int,
     ui_state: dict,
     config: SimulationConfig,
+    quality: Optional[LocalizationQuality] = None,
+    autonomous_mode: bool = False,
+    waypoint_distance_px: Optional[float] = None,
 ) -> None:
     x, y, width, height = map_rect
+
     if ui_state.get("info_panel", True):
+        gsd_cm = (
+            altitude_state.center_gsd_cm_per_px
+            if altitude_state.center_gsd_cm_per_px > 0.0
+            else float(config.reference_map_gsd_cm_per_px)
+        )
+        error_m = error_pixels * gsd_cm / 100.0
         hud_lines = [
             "SCN: %s" % get_scenario_label(config),
             "HDG: %s" % format_heading_label(heading_degrees),
-            "ERR: %.1f px" % error_pixels,
-            "ROI: %d px" % search_window_size,
-            "CMD: %s" % get_action_label(last_action),
+            "ERR: %.1f m" % error_m,
         ]
+        kalman_runtime_on = bool(ui_state.get("kalman_on", config.kalman_enabled))
+        if kalman_error_pixels is not None and kalman_runtime_on:
+            hud_lines.append("KLM: %.1f m" % (kalman_error_pixels * gsd_cm / 100.0))
+        elif not kalman_runtime_on:
+            hud_lines.append("KLM: KAPALI")
         if is_altitude_scenario(config):
             hud_lines.insert(2, "ALT: %.1f m AGL" % altitude_state.altitude_agl_m)
             hud_lines.insert(3, "GSD: %.2f cm/px" % altitude_state.center_gsd_cm_per_px)
+        hud_lines += [
+            "ISC: %s" % intersection_mode,
+            "ROI: %d px" % search_window_size,
+            "CMD: %s" % get_action_label(last_action),
+        ]
+        if autonomous_mode:
+            hud_lines.insert(0, ">>> OTONOM <<<")
+            if waypoint_distance_px is not None:
+                wpt_m = waypoint_distance_px * gsd_cm / 100.0
+                hud_lines.insert(1, "WPT: %.0f m" % wpt_m)
         draw_info_panel(
             canvas,
             hud_lines,
             top_left=(x + 28, y + 96),
-            font_scale=1.00,
+            font_scale=0.90,
             thickness=2,
-            alpha=0.55,
+            alpha=0.58,
             padding=18,
             corner_radius=18,
         )
 
-    help_line_1 = "WASD hareket | Q/E donus"
+        # Skor çubukları
+        bar_x = x + 28
+        bar_y = y + 96 + len(hud_lines) * 26 + 18
+        _draw_score_bars(canvas, score_values, bar_x, bar_y)
+
+        # Güven çubuğu
+        if quality is not None:
+            _draw_confidence_bar(
+                canvas,
+                quality.confidence,
+                quality.is_reliable,
+                bar_x,
+                bar_y + 3 * 14 + 14,
+            )
+
+    # Otonom mod büyük göstergesi (sağ üst köşe)
+    if autonomous_mode:
+        label = "OTONOM"
+        font_scale = 0.90
+        thickness = 2
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
+        badge_x = x + width - tw - 28
+        badge_y = y + 14
+        _draw_alpha_rounded_panel(canvas, badge_x - 10, badge_y - th - 6, badge_x + tw + 10,
+                                  badge_y + 8, 8, (0, 140, 20), 0.75)
+        cv2.putText(canvas, label, (badge_x, badge_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, font_scale, (80, 255, 120), thickness, cv2.LINE_AA)
+
+    help_line_1 = "WASD hareket | Q/E donus | P otonom"
     if is_altitude_scenario(config):
         help_line_1 += " | +/- irtifa"
     help_line_2 = "H panel | B bilgi | T iz | O ROI | R TM | Y yon | G gozlem | ESC/X cikis"
@@ -2510,6 +2945,12 @@ def draw_localization_dashboard(
     ui_state: dict,
     runtime_ui_buttons: List[dict],
     config: SimulationConfig,
+    kalman_center: Optional[Tuple[int, int]] = None,
+    waypoint_target: Optional[Tuple[int, int]] = None,
+    autonomous_mode: bool = False,
+    quality: Optional[LocalizationQuality] = None,
+    kalman_error_pixels: Optional[float] = None,
+    waypoint_distance_px: Optional[float] = None,
 ) -> np.ndarray:
     dashboard_width, dashboard_height = config.display_size
     canvas = np.full(
@@ -2625,6 +3066,35 @@ def draw_localization_dashboard(
             max(2, overlay_thickness - 1),
         )
 
+    # --- Kalman tahmin noktası (sarı) ---
+    if kalman_center is not None and config.kalman_enabled:
+        scaled_kalman = scale_point_to_preview(kalman_center, reference_preview_state)
+        kalman_r = max(3, marker_radius - 2)
+        cv2.circle(preview, scaled_kalman, kalman_r + 2, (0, 0, 0), -1)
+        cv2.circle(preview, scaled_kalman, kalman_r, (0, 220, 255), -1)
+        cv2.putText(
+            preview, "K",
+            (scaled_kalman[0] + kalman_r + 3, scaled_kalman[1] + 5),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 220, 255), 1, cv2.LINE_AA,
+        )
+
+    # --- Waypoint işaretçisi (magenta) ---
+    if waypoint_target is not None:
+        scaled_wp = scale_point_to_preview(waypoint_target, reference_preview_state)
+        wp_color = (255, 40, 200)
+        cv2.drawMarker(preview, scaled_wp, wp_color, cv2.MARKER_CROSS, 28, 2, cv2.LINE_AA)
+        accept_r = max(4, int(round(config.waypoint_acceptance_radius_px * reference_preview_state.scale_x)))
+        cv2.circle(preview, scaled_wp, accept_r, wp_color, 1, cv2.LINE_AA)
+        cv2.putText(
+            preview, "WP",
+            (scaled_wp[0] + accept_r + 3, scaled_wp[1] + 5),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.52, wp_color, 1, cv2.LINE_AA,
+        )
+        # Kalman → waypoint yönlendirme çizgisi (otonom modda)
+        if autonomous_mode and kalman_center is not None:
+            scaled_kc = scale_point_to_preview(kalman_center, reference_preview_state)
+            cv2.line(preview, scaled_kc, scaled_wp, wp_color, 1, cv2.LINE_AA)
+
     draw_panel(
         canvas,
         observation_view,
@@ -2655,16 +3125,20 @@ def draw_localization_dashboard(
         predicted_center,
         actual_center,
         compute_error_pixels(predicted_center, actual_center),
-        step_count,
-        last_action,
-        heading_degrees,
-        altitude_state,
-        intersection_mode,
-        search_mode,
-        match_backend,
-        search_window_size,
-        ui_state,
-        config,
+        kalman_error_pixels=kalman_error_pixels,
+        step_count=step_count,
+        last_action=last_action,
+        heading_degrees=heading_degrees,
+        altitude_state=altitude_state,
+        intersection_mode=intersection_mode,
+        search_mode=search_mode,
+        match_backend=match_backend,
+        search_window_size=search_window_size,
+        ui_state=ui_state,
+        config=config,
+        quality=quality,
+        autonomous_mode=autonomous_mode,
+        waypoint_distance_px=waypoint_distance_px,
     )
     if config.ui_buttons_enabled:
         _draw_runtime_buttons(canvas, ui_state, runtime_ui_buttons, config)
@@ -2882,6 +3356,7 @@ def choose_initial_cursor(
 
 def main() -> None:
     config = SimulationConfig()
+    config = _apply_args_to_config(config, _parse_args())
     reference_map, observation_map, model = load_assets(config)
     terrain_context: Optional[TerrainContext] = None
 
@@ -2891,11 +3366,7 @@ def main() -> None:
 
         if config.diagnostic_benchmark_enabled:
             run_template_diagnostics(
-                reference_map,
-                observation_map,
-                model,
-                terrain_context,
-                config,
+                reference_map, observation_map, model, terrain_context, config,
             )
             if config.diagnostic_benchmark_only:
                 return
@@ -2903,261 +3374,317 @@ def main() -> None:
         observation_rect, template_rect, map_rect = get_dashboard_layout(config)
 
         row, col = choose_initial_cursor(observation_map.shape, config)
-        predicted_history = []
-        actual_history = []
+        predicted_history: List[Tuple[int, int]] = []
+        actual_history: List[Tuple[int, int]] = []
         step_count = 0
         last_action = ""
         heading_degrees = normalize_heading_degrees(config.initial_heading_degrees)
         altitude_agl_m = clamp_altitude_agl(config.initial_altitude_agl_m, config)
-        previous_predicted_center = None
+        previous_predicted_center: Optional[Tuple[int, int]] = None
         search_window_size = config.base_search_window_size
+        kalman: Optional[PositionKalmanFilter] = None
+        low_confidence_steps = 0
+
         runtime_ui_state = create_runtime_ui_state(config)
         runtime_ui_buttons = _build_runtime_buttons() if config.ui_buttons_enabled else []
-        runtime_ui_context = {
+        runtime_ui_context: dict = {
             "state": runtime_ui_state,
             "buttons": runtime_ui_buttons,
+            "reference_preview_state": None,
+            "waypoint_target": None,
         }
 
-        cv2.namedWindow(config.dashboard_window_name, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(
-            config.dashboard_window_name,
-            config.display_size[0],
-            config.display_size[1],
-        )
-        if config.ui_buttons_enabled:
+        csv_writer, csv_file = _open_csv_log(config)
+
+        try:
+            cv2.namedWindow(config.dashboard_window_name, cv2.WINDOW_NORMAL)
+            cv2.resizeWindow(
+                config.dashboard_window_name,
+                config.display_size[0],
+                config.display_size[1],
+            )
             cv2.setMouseCallback(
                 config.dashboard_window_name,
                 _runtime_buttons_mouse_cb,
                 runtime_ui_context,
             )
 
-        while True:
-            current_search_window_size = search_window_size
-            (
-                templates,
-                observation_windows,
-                observation_boxes,
-                actual_boxes,
-                row,
-                col,
-                altitude_state,
-            ) = extract_template_triplet(
-                observation_map,
-                row,
-                col,
-                heading_degrees,
-                altitude_agl_m,
-                terrain_context,
-                model,
-                config,
-            )
-            altitude_agl_m = altitude_state.altitude_agl_m
-            actual_intersection_box, _ = compute_intersection_box(actual_boxes)
-            search_anchor_center = previous_predicted_center
-            if search_anchor_center is None and step_count == 0:
-                search_anchor_center = get_box_center(actual_intersection_box)
-            search_region, search_origin, search_window_box, search_mode = (
-                extract_search_region(
-                    reference_map,
-                    search_anchor_center,
-                    current_search_window_size,
-                    step_count,
-                    config,
-                )
-            )
-            score_values, matched_boxes, predicted_intersection_box, intersection_mode, match_backend = (
-                localize_template_triplet(search_region, search_origin, templates, config)
-            )
-
-            predicted_center = get_box_center(predicted_intersection_box)
-            actual_center = get_box_center(actual_intersection_box)
-            error_pixels = compute_error_pixels(predicted_center, actual_center)
-            strict_triplet_lock = is_strict_triplet_alignment(
-                matched_boxes,
-                intersection_mode,
-                config,
-            )
-            if strict_triplet_lock:
-                previous_predicted_center = predicted_center
-            elif previous_predicted_center is None:
-                previous_predicted_center = search_anchor_center
-            search_window_size = update_search_window_size(
-                current_search_window_size,
-                matched_boxes,
-                intersection_mode,
-                config,
-            )
-
-            predicted_history.append(predicted_center)
-            actual_history.append(actual_center)
-            predicted_history = predicted_history[-config.path_history_limit :]
-            actual_history = actual_history[-config.path_history_limit :]
-            reference_viewport_box = get_reference_viewport_box(
-                reference_map.shape,
-                predicted_intersection_box,
-                actual_intersection_box,
-                search_window_box,
-                search_mode,
-                config,
-            )
-            reference_preview_state = create_reference_preview_state(
-                reference_map,
-                map_rect,
-                reference_viewport_box,
-                config,
-            )
-
-            observation_view = create_observation_view(
-                observation_map,
-                observation_boxes,
-                actual_boxes,
-                actual_intersection_box,
-                observation_windows,
-                altitude_state,
-                heading_degrees,
-                runtime_ui_state,
-                config,
-            )
-            template_strip = create_template_strip(templates, config)
-
-            print_localization_status(
-                score_values,
-                matched_boxes,
-                predicted_intersection_box,
-                actual_intersection_box,
-                row,
-                col,
-                error_pixels,
-                step_count,
-                last_action,
-                heading_degrees,
-                altitude_state,
-                intersection_mode,
-                search_mode,
-                match_backend,
-                current_search_window_size,
-                config,
-            )
-
-            dashboard = draw_localization_dashboard(
-                observation_rect=observation_rect,
-                template_rect=template_rect,
-                reference_preview_state=reference_preview_state,
-                observation_view=observation_view,
-                template_strip=template_strip,
-                matched_boxes=matched_boxes,
-                predicted_intersection_box=predicted_intersection_box,
-                actual_intersection_box=actual_intersection_box,
-                search_window_box=search_window_box,
-                predicted_history=predicted_history,
-                actual_history=actual_history,
-                score_values=score_values,
-                observation_cursor=(row, col),
-                step_count=step_count,
-                last_action=last_action,
-                heading_degrees=heading_degrees,
-                altitude_state=altitude_state,
-                intersection_mode=intersection_mode,
-                search_mode=search_mode,
-                match_backend=match_backend,
-                search_window_size=current_search_window_size,
-                ui_state=runtime_ui_state,
-                runtime_ui_buttons=runtime_ui_buttons,
-                config=config,
-            )
-            should_exit = False
             while True:
-                cv2.imshow(config.dashboard_window_name, dashboard)
-                runtime_ui_state["_dirty"] = False
-                key = cv2.waitKeyEx(30)
+                current_search_window_size = search_window_size
+                (
+                    templates,
+                    observation_windows,
+                    observation_boxes,
+                    actual_boxes,
+                    row,
+                    col,
+                    altitude_state,
+                ) = extract_template_triplet(
+                    observation_map, row, col, heading_degrees,
+                    altitude_agl_m, terrain_context, model, config,
+                )
+                altitude_agl_m = altitude_state.altitude_agl_m
+                actual_intersection_box, _ = compute_intersection_box(actual_boxes)
 
-                if runtime_ui_state.get("_dirty"):
-                    dashboard = draw_localization_dashboard(
-                        observation_rect=observation_rect,
-                        template_rect=template_rect,
-                        reference_preview_state=reference_preview_state,
-                        observation_view=observation_view,
-                        template_strip=template_strip,
-                        matched_boxes=matched_boxes,
-                        predicted_intersection_box=predicted_intersection_box,
-                        actual_intersection_box=actual_intersection_box,
-                        search_window_box=search_window_box,
-                        predicted_history=predicted_history,
-                        actual_history=actual_history,
-                        score_values=score_values,
-                        observation_cursor=(row, col),
-                        step_count=step_count,
-                        last_action=last_action,
-                        heading_degrees=heading_degrees,
-                        altitude_state=altitude_state,
-                        intersection_mode=intersection_mode,
-                        search_mode=search_mode,
-                        match_backend=match_backend,
-                        search_window_size=current_search_window_size,
-                        ui_state=runtime_ui_state,
-                        runtime_ui_buttons=runtime_ui_buttons,
-                        config=config,
+                search_anchor_center = previous_predicted_center
+                if search_anchor_center is None and step_count == 0:
+                    search_anchor_center = get_box_center(actual_intersection_box)
+                search_region, search_origin, _search_window_box, search_mode = extract_search_region(
+                    reference_map, search_anchor_center, current_search_window_size,
+                    step_count, config,
+                )
+                score_values, matched_boxes, predicted_intersection_box, intersection_mode, match_backend = (
+                    localize_template_triplet(search_region, search_origin, templates, config)
+                )
+
+                raw_predicted_center = get_box_center(predicted_intersection_box)
+                actual_center = get_box_center(actual_intersection_box)
+
+                # --- Lokalizasyon kalitesi (gps_denied_autonomy) ---
+                quality = compute_localization_quality(
+                    score_values,
+                    matched_boxes,
+                    predicted_intersection_box,
+                    intersection_mode,
+                    is_sqdiff_method(config.match_method),
+                    config.localization_score_threshold,
+                    config.localization_confidence_threshold,
+                    config.localization_spread_threshold_px,
+                )
+
+                # --- Kalman filtresi (K tuşuyla çalışma anında aç/kapat) ---
+                use_kalman = bool(runtime_ui_state.get("kalman_on", config.kalman_enabled))
+                if use_kalman:
+                    if kalman is None:
+                        # Yeni açıldıysa mevcut fused center'dan başlat
+                        init_pos = (
+                            previous_predicted_center
+                            if previous_predicted_center is not None
+                            else (search_anchor_center if search_anchor_center is not None else actual_center)
+                        )
+                        kalman = PositionKalmanFilter(
+                            init_pos, config.kalman_process_noise, config.kalman_measurement_noise,
+                        )
+                    moved = propagate_center_with_action(
+                        (0, 0), last_action, heading_degrees, float(config.step_size),
                     )
-                    continue
-
-                if key == -1:
-                    continue
-
-                if config.ui_buttons_enabled and apply_runtime_ui_hotkey(
-                    key,
-                    runtime_ui_state,
-                ):
-                    dashboard = draw_localization_dashboard(
-                        observation_rect=observation_rect,
-                        template_rect=template_rect,
-                        reference_preview_state=reference_preview_state,
-                        observation_view=observation_view,
-                        template_strip=template_strip,
-                        matched_boxes=matched_boxes,
-                        predicted_intersection_box=predicted_intersection_box,
-                        actual_intersection_box=actual_intersection_box,
-                        search_window_box=search_window_box,
-                        predicted_history=predicted_history,
-                        actual_history=actual_history,
-                        score_values=score_values,
-                        observation_cursor=(row, col),
-                        step_count=step_count,
-                        last_action=last_action,
-                        heading_degrees=heading_degrees,
-                        altitude_state=altitude_state,
-                        intersection_mode=intersection_mode,
-                        search_mode=search_mode,
-                        match_backend=match_backend,
-                        search_window_size=current_search_window_size,
-                        ui_state=runtime_ui_state,
-                        runtime_ui_buttons=runtime_ui_buttons,
-                        config=config,
+                    kalman.predict(
+                        float(moved[0]) if moved is not None else 0.0,
+                        float(moved[1]) if moved is not None else 0.0,
                     )
-                    continue
+                    if quality.is_reliable:
+                        kalman.update(
+                            float(raw_predicted_center[0]),
+                            float(raw_predicted_center[1]),
+                            quality.confidence,
+                        )
+                else:
+                    # Kalman kapalıyken filtreyi sıfırla; sonraki açılışta yeniden başlasın
+                    kalman = None
 
-                if key in EXIT_KEYS:
-                    should_exit = True
+                kalman_center: Optional[Tuple[int, int]] = (
+                    kalman.position if (kalman is not None and use_kalman) else None
+                )
+
+                # --- Sensör füzyonu ---
+                _prior_was_none = previous_predicted_center is None
+                fused_center, _fusion_ok, _jump_px = fuse_measurement_with_prior(
+                    previous_predicted_center,
+                    raw_predicted_center,
+                    quality,
+                    config.max_visual_jump_px,
+                    config.sensor_fusion_blend_gain,
+                )
+                # Step-0'da prior yokken kalite düşükse güvenli başlangıç konumuna dön
+                if _prior_was_none and not _fusion_ok:
+                    previous_predicted_center = actual_center
+                elif kalman_center is not None and use_kalman:
+                    # Kalman açıkken arama çerçevesi Kalman pozisyonuna odaklanır;
+                    # tek-adım yanlış eşleşmelerine karşı daha dayanıklı
+                    previous_predicted_center = kalman_center
+                else:
+                    previous_predicted_center = fused_center
+
+                search_window_size = update_search_window_size(
+                    current_search_window_size, matched_boxes, intersection_mode, config,
+                )
+
+                low_confidence_steps = 0 if quality.is_reliable else low_confidence_steps + 1
+
+                display_predicted_center = (
+                    kalman_center if kalman_center is not None else fused_center
+                )
+                error_pixels = compute_error_pixels(display_predicted_center, actual_center)
+                kalman_error_pixels: Optional[float] = (
+                    compute_error_pixels(kalman_center, actual_center)
+                    if kalman_center is not None else None
+                )
+
+                waypoint_target: Optional[Tuple[int, int]] = runtime_ui_context.get("waypoint_target")
+                waypoint_distance_px: Optional[float] = (
+                    math.hypot(
+                        display_predicted_center[0] - waypoint_target[0],
+                        display_predicted_center[1] - waypoint_target[1],
+                    )
+                    if waypoint_target is not None else None
+                )
+                autonomous_mode = bool(runtime_ui_state.get("autonomous_mode", False))
+
+                predicted_history.append(display_predicted_center)
+                actual_history.append(actual_center)
+                predicted_history = predicted_history[-config.path_history_limit :]
+                actual_history = actual_history[-config.path_history_limit :]
+
+                # Gösterim için arama çerçevesini güncel tahmin merkezine ortala;
+                # üçlü kesişim sonrası küçülen pencere de UAV'ı merkeze alır
+                display_search_window_box = get_search_window_box(
+                    reference_map.shape, display_predicted_center, search_window_size,
+                )
+
+                reference_viewport_box = get_reference_viewport_box(
+                    reference_map.shape, predicted_intersection_box,
+                    actual_intersection_box, display_search_window_box, search_mode, config,
+                )
+                reference_preview_state = create_reference_preview_state(
+                    reference_map, map_rect, reference_viewport_box, config,
+                )
+                runtime_ui_context["reference_preview_state"] = reference_preview_state
+
+                observation_view = create_observation_view(
+                    observation_map, observation_boxes, actual_boxes, actual_intersection_box,
+                    observation_windows, altitude_state, heading_degrees, runtime_ui_state, config,
+                )
+                template_strip = create_template_strip(templates, config)
+
+                print_localization_status(
+                    score_values, matched_boxes, predicted_intersection_box,
+                    actual_intersection_box, row, col, error_pixels, step_count,
+                    last_action, heading_degrees, altitude_state, intersection_mode,
+                    search_mode, match_backend, current_search_window_size, config,
+                )
+
+                if csv_writer is not None:
+                    _write_csv_row(
+                        csv_writer, step_count, row, col, heading_degrees, altitude_state,
+                        last_action, score_values, intersection_mode, search_mode, match_backend,
+                        actual_center, raw_predicted_center, kalman_center, actual_center,
+                        quality, current_search_window_size,
+                    )
+
+                # Tekrar kullanılacak dashboard kwargs
+                _dash_kw: dict = dict(
+                    observation_rect=observation_rect,
+                    template_rect=template_rect,
+                    reference_preview_state=reference_preview_state,
+                    observation_view=observation_view,
+                    template_strip=template_strip,
+                    matched_boxes=matched_boxes,
+                    predicted_intersection_box=predicted_intersection_box,
+                    actual_intersection_box=actual_intersection_box,
+                    search_window_box=display_search_window_box,
+                    predicted_history=predicted_history,
+                    actual_history=actual_history,
+                    score_values=score_values,
+                    observation_cursor=(row, col),
+                    step_count=step_count,
+                    last_action=last_action,
+                    heading_degrees=heading_degrees,
+                    altitude_state=altitude_state,
+                    intersection_mode=intersection_mode,
+                    search_mode=search_mode,
+                    match_backend=match_backend,
+                    search_window_size=current_search_window_size,
+                    ui_state=runtime_ui_state,
+                    runtime_ui_buttons=runtime_ui_buttons,
+                    config=config,
+                    kalman_center=kalman_center,
+                    waypoint_target=waypoint_target,
+                    autonomous_mode=autonomous_mode,
+                    quality=quality,
+                    kalman_error_pixels=kalman_error_pixels,
+                    waypoint_distance_px=waypoint_distance_px,
+                )
+                dashboard = draw_localization_dashboard(**_dash_kw)
+
+                # --- İç döngü: tuş bekleme / otonom adım ---
+                should_exit = False
+                while True:
+                    cv2.imshow(config.dashboard_window_name, dashboard)
+                    runtime_ui_state["_dirty"] = False
+                    wait_ms = (
+                        config.autonomous_step_interval_ms
+                        if bool(runtime_ui_state.get("autonomous_mode", False))
+                        else 30
+                    )
+                    key = cv2.waitKeyEx(wait_ms)
+
+                    if runtime_ui_state.get("_dirty"):
+                        # waypoint veya toggle değişmiş olabilir
+                        _dash_kw["waypoint_target"] = runtime_ui_context.get("waypoint_target")
+                        _dash_kw["autonomous_mode"] = bool(runtime_ui_state.get("autonomous_mode", False))
+                        dashboard = draw_localization_dashboard(**_dash_kw)
+                        continue
+
+                    if key in EXIT_KEYS:
+                        should_exit = True
+                        break
+
+                    if key != -1 and config.ui_buttons_enabled and apply_runtime_ui_hotkey(
+                        key, runtime_ui_state,
+                    ):
+                        _dash_kw["autonomous_mode"] = bool(runtime_ui_state.get("autonomous_mode", False))
+                        # Kalman toggle: bir sonraki adımda kalman bloğu sıfırlanacak;
+                        # şimdilik HUD'ı güncelle
+                        dashboard = draw_localization_dashboard(**_dash_kw)
+                        # Kalman K tuşuyla değişmişse hemen sonraki adıma geç
+                        if key in KALMAN_TOGGLE_KEYS:
+                            step_count += 1
+                            break
+                        continue
+
+                    if bool(runtime_ui_state.get("autonomous_mode", False)):
+                        auto_action = choose_autonomous_action(
+                            display_predicted_center,
+                            runtime_ui_context.get("waypoint_target"),
+                            heading_degrees,
+                            low_confidence_steps,
+                            config.waypoint_acceptance_radius_px,
+                            config.waypoint_rotation_tolerance_deg,
+                            config.waypoint_body_axis_deadband_px,
+                        )
+                        if auto_action not in ("hold", ""):
+                            row, col, heading_degrees, altitude_agl_m = apply_control_action(
+                                row, col, heading_degrees, altitude_agl_m,
+                                auto_action, observation_map.shape, config,
+                            )
+                            last_action = auto_action
+                        step_count += 1
+                        break
+
+                    # Manuel mod
+                    if key == -1:
+                        continue
+
+                    action = get_action_from_key(key)
+                    if action:
+                        row, col, heading_degrees, altitude_agl_m = apply_control_action(
+                            row, col, heading_degrees, altitude_agl_m,
+                            action, observation_map.shape, config,
+                        )
+                        last_action = action
+                        step_count += 1
+                        break
+
+                    print("Unrecognized key code: %s" % key)
+
+                if should_exit:
                     break
 
-                action = get_action_from_key(key)
-                if action:
-                    row, col, heading_degrees, altitude_agl_m = apply_control_action(
-                        row,
-                        col,
-                        heading_degrees,
-                        altitude_agl_m,
-                        action,
-                        observation_map.shape,
-                        config,
-                    )
-                    last_action = action
-                    step_count += 1
-                    break
+        finally:
+            if csv_file is not None:
+                csv_file.close()
+                print("CSV log kaydedildi: %s" % (config.log_csv_path or "log_simulasyon_*.csv"))
 
-                print("Unrecognized key code: %s" % key)
-
-            if should_exit:
-                break
     finally:
         close_terrain_context(terrain_context)
         cv2.destroyAllWindows()
