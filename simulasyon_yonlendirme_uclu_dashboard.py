@@ -143,7 +143,29 @@ ALTITUDE_DOWN_KEYS = (ord("-"), ord("_"), 45, 95, 109)
 EXIT_KEYS = (27, ord("x"), ord("X"))
 AUTONOMOUS_TOGGLE_KEYS = (ord("p"), ord("P"))
 KALMAN_TOGGLE_KEYS = (ord("k"), ord("K"))
+NORM_CYCLE_KEYS = (ord("n"), ord("N"))
 REF_PATCH_TOGGLE_KEYS = (ord("m"), ord("M"))
+
+_NORM_MODES = ("HAM", "CLAHE", "HISTEQ", "EDGE")
+
+
+def apply_observation_norm(image: np.ndarray, mode: str) -> np.ndarray:
+    gray = image if image.ndim == 2 else cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    if mode == "CLAHE":
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        return clahe.apply(gray)
+    if mode == "HISTEQ":
+        return cv2.equalizeHist(gray)
+    if mode == "EDGE":
+        edges = cv2.Laplacian(gray, cv2.CV_32F)
+        edges = np.abs(edges)
+        max_v = edges.max()
+        if max_v > 0:
+            edges = (edges / max_v * 255.0).astype(np.uint8)
+        else:
+            edges = np.zeros_like(gray)
+        return edges
+    return gray
 COMPASS_LABELS = ("K", "KD", "D", "GD", "G", "GB", "B", "KB")
 _QT_KEY_MAP = {
     16777235: 65362,  # Qt.Key_Up
@@ -223,6 +245,7 @@ class SimulationConfig:
     max_search_window_size: int = 15000
     search_window_growth_step: int = 100
     search_window_failure_growth: int = 500
+    kalman_window_growth_factor: float = 0.4
     triplet_alignment_tolerance_px: float = 45.0
     global_refresh_interval: int = 0
     dashboard_background_color: Tuple[int, int, int] = (18, 18, 24)
@@ -284,7 +307,7 @@ class SimulationConfig:
     sensor_fusion_blend_gain: float = 0.75
     max_visual_jump_px: float = 600.0
     # --- Kalman filtresi ---
-    kalman_enabled: bool = False
+    kalman_enabled: bool = True
     kalman_process_noise: float = 50.0
     kalman_measurement_noise: float = 80.0
     # --- CSV adım loglama ---
@@ -1369,6 +1392,7 @@ def create_runtime_ui_state(config: SimulationConfig) -> dict:
         "observation_boxes": bool(config.show_observation_boxes),
         "autonomous_mode": False,
         "kalman_on": bool(config.kalman_enabled),
+        "norm_mode": "HISTEQ",
         "ref_patch": False,
         "_panel_collapsed": True,
         "_hover_key": None,
@@ -1400,6 +1424,12 @@ def apply_runtime_ui_hotkey(key: int, ui_state: dict) -> bool:
         ord("m"): "ref_patch",
         ord("M"): "ref_patch",
     }
+    if key in NORM_CYCLE_KEYS:
+        current = ui_state.get("norm_mode", "HAM")
+        idx = _NORM_MODES.index(current) if current in _NORM_MODES else 0
+        ui_state["norm_mode"] = _NORM_MODES[(idx + 1) % len(_NORM_MODES)]
+        ui_state["_dirty"] = True
+        return True
     target = hotkey_map.get(key)
     if target is None:
         return False
@@ -1475,13 +1505,17 @@ def get_observation_boxes(
     heading_degrees: float,
     config: SimulationConfig,
 ) -> List[Tuple[int, int, int, int]]:
-    _ = heading_degrees
     size = config.sample_window_size
     offset = config.template_offset
+    # Offset vektörünü UAV başlık açısıyla döndür:
+    # baseline her zaman gövde ekseniyle (diagonal forward-right) hizalı kalır
+    raw_dx, raw_dy = rotate_image_offset(float(offset), float(offset), heading_degrees)
+    idx = int(round(raw_dx))
+    idy = int(round(raw_dy))
     return [
-        (col - size - offset, row - size - offset, size, size),
-        (col - size, row - size, size, size),
-        (col - size + offset, row - size + offset, size, size),
+        (col - size - idx, row - size - idy, size, size),
+        (col - size,       row - size,       size, size),
+        (col - size + idx, row - size + idy, size, size),
     ]
 
 
@@ -1584,6 +1618,7 @@ def extract_rotated_observation_window(
 def prepare_triplet_for_model(
     observation_windows: List[np.ndarray],
     config: SimulationConfig,
+    norm_mode: str = "HISTEQ",
 ) -> np.ndarray:
     prepared_windows = []
     for observation_window in observation_windows:
@@ -1592,8 +1627,8 @@ def prepare_triplet_for_model(
             (config.model_input_size, config.model_input_size),
             interpolation=cv2.INTER_NEAREST,
         )
-        equalized_window = cv2.equalizeHist(resized_window)
-        normalized_window = (equalized_window.astype(np.float32) - 127.5) / 127.5
+        normed_window = apply_observation_norm(resized_window, norm_mode)
+        normalized_window = (normed_window.astype(np.float32) - 127.5) / 127.5
         prepared_windows.append(normalized_window)
 
     return np.stack(prepared_windows, axis=0).reshape(
@@ -1635,6 +1670,7 @@ def extract_template_triplet(
     terrain_context: Optional[TerrainContext],
     model: object,
     config: SimulationConfig,
+    norm_mode: str = "HISTEQ",
 ) -> Tuple[
     List[np.ndarray],
     List[np.ndarray],
@@ -1673,7 +1709,7 @@ def extract_template_triplet(
             )
         )
 
-    model_input_triplet = prepare_triplet_for_model(observation_windows, config)
+    model_input_triplet = prepare_triplet_for_model(observation_windows, config, norm_mode)
     templates = predict_template_triplet(model, model_input_triplet, config)
     template_boxes = get_template_boxes_from_observation_boxes(observation_boxes, config)
 
@@ -1940,6 +1976,7 @@ def is_strict_triplet_alignment(
     matched_boxes: List[Tuple[int, int, int, int]],
     intersection_mode: str,
     config: SimulationConfig,
+    heading_degrees: float = 0.0,
 ) -> bool:
     if intersection_mode != "abc" or len(matched_boxes) != 3:
         return False
@@ -1955,25 +1992,28 @@ def is_strict_triplet_alignment(
     midpoint_x = (center_a[0] + center_c[0]) / 2.0
     midpoint_y = (center_a[1] + center_c[1]) / 2.0
     midpoint_error = math.hypot(center_b[0] - midpoint_x, center_b[1] - midpoint_y)
-    expected_offset = float(config.template_offset)
+
+    # Başlık açısına göre döndürülmüş beklenen delta
+    exp_dx, exp_dy = rotate_image_offset(
+        float(config.template_offset), float(config.template_offset), heading_degrees
+    )
     step_error = max(
-        abs(delta_ab_x - expected_offset),
-        abs(delta_ab_y - expected_offset),
-        abs(delta_bc_x - expected_offset),
-        abs(delta_bc_y - expected_offset),
+        abs(delta_ab_x - exp_dx),
+        abs(delta_ab_y - exp_dy),
+        abs(delta_bc_x - exp_dx),
+        abs(delta_bc_y - exp_dy),
     )
     symmetry_error = max(
         abs(delta_ab_x - delta_bc_x),
         abs(delta_ab_y - delta_bc_y),
     )
-    monotonic_diagonal = (
-        delta_ab_x > 0.0
-        and delta_ab_y > 0.0
-        and delta_bc_x > 0.0
-        and delta_bc_y > 0.0
-    )
+    # Yön kontrolü: gerçek delta beklenen yönle aynı tarafta mı?
+    # (monotonic_diagonal yerine; beklenen delta negatif bileşen içerebilir)
+    dot_ab = delta_ab_x * exp_dx + delta_ab_y * exp_dy
+    correct_direction = dot_ab > 0.0
+
     alignment_error = max(midpoint_error, step_error, symmetry_error)
-    return monotonic_diagonal and (
+    return correct_direction and (
         alignment_error <= float(config.triplet_alignment_tolerance_px)
     )
 
@@ -2526,7 +2566,7 @@ def create_observation_view(
     config: SimulationConfig,
     actual_crop: Optional[np.ndarray] = None,
 ) -> np.ndarray:
-    _ = (actual_boxes, actual_intersection_box, actual_crop, heading_degrees, ui_state)
+    _ = (actual_boxes, actual_intersection_box, actual_crop, heading_degrees)
     if len(observation_boxes) < 3:
         return np.zeros(
             (config.sample_window_size, config.sample_window_size, 3),
@@ -2548,6 +2588,9 @@ def create_observation_view(
         display_img = observation_windows[1]
     else:
         display_img = extract_padded_patch(observation_map, observation_boxes[1])
+
+    norm_mode = ui_state.get("norm_mode", "HAM")
+    display_img = apply_observation_norm(display_img, norm_mode)
 
     _draw_observation_tile(
         canvas,
@@ -3037,9 +3080,19 @@ def draw_right_telemetry_panel(
         cy = cx0 + row * (card_h + card_gap)
         _draw_metric_card(canvas, cx, cy, cw2, card_h, lbl, val, col)
 
-    # Tam genişlik kartlar (ISC, ROI, CMD)
+    # Tam genişlik kartlar (KLM, ISC, ROI, CMD)
     full_y = cx0 + 3 * (card_h + card_gap)
+    _kalman_is_on = bool(ui_state.get("kalman_on", False))
+    if _kalman_is_on and kalman_error_pixels is not None:
+        _klm_val = "%.1fm" % (kalman_error_pixels * gsd_cm / 100.0)
+    else:
+        _klm_val = "AKTIF" if _kalman_is_on else "KAPALI"
+    _klm_color = _TP_SUCCESS if _kalman_is_on else _TP_LABEL
+    _norm_mode = ui_state.get("norm_mode", "HAM")
+    _nrm_color = _TP_SUCCESS if _norm_mode != "HAM" else _TP_LABEL
     full_cards = [
+        ("KLM", _klm_val, _klm_color),
+        ("NRM", _norm_mode, _nrm_color),
         ("ISC", intersection_mode, _TP_VALUE),
         ("ROI", "%d px" % search_window_size, _TP_VALUE),
         ("CMD", get_action_label(last_action), _TP_VALUE),
@@ -3098,7 +3151,7 @@ def draw_hud(
     help_line_1 = "WASD hareket  |  Q/E dönüş  |  P otonom"
     if is_altitude_scenario(config):
         help_line_1 += "  |  +/- irtifa"
-    help_line_2 = "H panel  |  T iz  |  O ROI  |  R kutular  |  K Kalman  |  ESC/X çıkış"
+    help_line_2 = "H panel  |  T iz  |  O ROI  |  R kutular  |  K Kalman  |  N norm  |  ESC/X çıkış"
     _hl1_w, _hl1_h = cv2.getTextSize(
         help_line_1, cv2.FONT_HERSHEY_SIMPLEX, 0.52, 2
     )[0]
@@ -3492,6 +3545,7 @@ def print_localization_status(
         matched_boxes,
         intersection_mode,
         config,
+        heading_degrees,
     )
     print("cursor=(row=%d, col=%d)" % (row, col))
     print(
@@ -3535,17 +3589,20 @@ def update_search_window_size(
     matched_boxes: List[Tuple[int, int, int, int]],
     intersection_mode: str,
     config: SimulationConfig,
+    heading_degrees: float = 0.0,
+    use_kalman: bool = False,
 ) -> int:
-    if is_strict_triplet_alignment(matched_boxes, intersection_mode, config):
+    if is_strict_triplet_alignment(matched_boxes, intersection_mode, config, heading_degrees):
         return config.base_search_window_size
+    factor = float(config.kalman_window_growth_factor) if use_kalman else 1.0
     if intersection_mode in ("abc", "ab", "bc", "ac"):
         return min(
             config.max_search_window_size,
-            current_search_window_size + config.search_window_growth_step,
+            current_search_window_size + max(1, int(config.search_window_growth_step * factor)),
         )
     return min(
         config.max_search_window_size,
-        current_search_window_size + config.search_window_failure_growth,
+        current_search_window_size + max(1, int(config.search_window_failure_growth * factor)),
     )
 
 
@@ -3659,6 +3716,7 @@ def main(
                 ) = extract_template_triplet(
                     observation_map, row, col, heading_degrees,
                     altitude_agl_m, terrain_context, model, config,
+                    norm_mode=runtime_ui_state.get("norm_mode", "HISTEQ"),
                 )
                 altitude_agl_m = altitude_state.altitude_agl_m
                 actual_intersection_box, _ = compute_intersection_box(actual_boxes)
@@ -3743,7 +3801,8 @@ def main(
                     previous_predicted_center = fused_center
 
                 search_window_size = update_search_window_size(
-                    current_search_window_size, matched_boxes, intersection_mode, config,
+                    current_search_window_size, matched_boxes, intersection_mode, config, heading_degrees,
+                    use_kalman=use_kalman,
                 )
 
                 low_confidence_steps = 0 if quality.is_reliable else low_confidence_steps + 1
