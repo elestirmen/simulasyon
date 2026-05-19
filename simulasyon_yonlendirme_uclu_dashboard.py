@@ -16,11 +16,21 @@ import dataclasses
 import json
 import math
 import os
+import queue as _queue
 import random
+import sys as _sys
 from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
 from typing import IO, List, Optional, Tuple
+
+try:
+    from PyQt5.QtWidgets import QApplication, QMainWindow, QLabel, QSizePolicy
+    from PyQt5.QtCore import Qt, QThread, pyqtSignal
+    from PyQt5.QtGui import QImage, QPixmap
+    _HAS_QT = True
+except ImportError:
+    _HAS_QT = False
 
 from gps_denied_autonomy import (
     LocalizationQuality,
@@ -53,7 +63,15 @@ ALTITUDE_DOWN_KEYS = (ord("-"), ord("_"), 45, 95, 109)
 EXIT_KEYS = (27, ord("x"), ord("X"))
 AUTONOMOUS_TOGGLE_KEYS = (ord("p"), ord("P"))
 KALMAN_TOGGLE_KEYS = (ord("k"), ord("K"))
+REF_PATCH_TOGGLE_KEYS = (ord("m"), ord("M"))
 COMPASS_LABELS = ("K", "KD", "D", "GD", "G", "GB", "B", "KB")
+_QT_KEY_MAP = {
+    16777235: 65362,  # Qt.Key_Up
+    16777237: 65364,  # Qt.Key_Down
+    16777234: 65361,  # Qt.Key_Left
+    16777236: 65363,  # Qt.Key_Right
+    16777216: 27,     # Qt.Key_Escape
+}
 TEMPLATE_COLORS = (
     (0, 0, 255),
     (0, 255, 0),
@@ -114,7 +132,8 @@ class SimulationConfig:
     virtual_camera_width_px: int = 544
     align_observation_to_reference_grid: bool = True
     display_size: Tuple[int, int] = (1000, 1000)
-    left_panel_width_ratio: float = 0.38
+    left_panel_width_ratio: float = 0.20
+    right_info_panel_width: int = 180
     match_method: int = cv2.TM_CCOEFF_NORMED
     use_parallel_matching: bool = True
     use_pyramid_matching: bool = True
@@ -298,6 +317,38 @@ _CSV_FIELDNAMES = (
     "guven", "skor_min", "skor_ort", "yayilma_px",
     "guvenilir", "guvenilirlik_neden", "arama_pencere_px",
 )
+
+
+def _imshow_keepratio(
+    window_name: str,
+    image: np.ndarray,
+    lb_state: dict,
+) -> None:
+    """Görüntüyü letterbox ile göster; pencere yeniden boyutlandırılırsa oran korunur.
+    lb_state sözlüğüne scale/x_off/y_off yazar — fare callback ters dönüşüm için kullanır."""
+    img_h, img_w = image.shape[:2]
+    try:
+        _, _, win_w, win_h = cv2.getWindowImageRect(window_name)
+    except Exception:
+        win_w, win_h = 0, 0
+
+    if win_w <= 0 or win_h <= 0:
+        lb_state.update(scale=1.0, x_off=0, y_off=0)
+        cv2.imshow(window_name, image)
+        return
+
+    scale = min(win_w / img_w, win_h / img_h)
+    new_w = int(img_w * scale)
+    new_h = int(img_h * scale)
+    x_off = (win_w - new_w) // 2
+    y_off = (win_h - new_h) // 2
+    lb_state.update(scale=scale, x_off=x_off, y_off=y_off)
+
+    interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
+    resized = cv2.resize(image, (new_w, new_h), interpolation=interp)
+    padded = np.zeros((win_h, win_w, 3), dtype=np.uint8)
+    padded[y_off : y_off + new_h, x_off : x_off + new_w] = resized
+    cv2.imshow(window_name, padded)
 
 
 def _open_csv_log(
@@ -1047,6 +1098,7 @@ def _build_runtime_buttons() -> List[dict]:
         {"key": "tm_boxes", "label": "TM Kutular", "hotkey": "R", "rect": (0, 0, 0, 0)},
         {"key": "heading_arrow", "label": "Yon Oku", "hotkey": "Y", "rect": (0, 0, 0, 0)},
         {"key": "observation_boxes", "label": "Gozlem Kutulari", "hotkey": "G", "rect": (0, 0, 0, 0)},
+        {"key": "ref_patch", "label": "Haritada Bulunan", "hotkey": "M", "rect": (0, 0, 0, 0)},
     ]
 
 
@@ -1175,6 +1227,12 @@ def _runtime_buttons_mouse_cb(event: int, x: int, y: int, flags: int, userdata: 
     _ = flags
     if not isinstance(userdata, dict):
         return
+    # Letterbox ters dönüşümü: ekran koordinatlarını dashboard koordinatlarına çevir
+    _lb = userdata.get("_lb", {})
+    _scale = float(_lb.get("scale", 1.0))
+    if _scale > 0.0:
+        x = int((x - int(_lb.get("x_off", 0))) / _scale)
+        y = int((y - int(_lb.get("y_off", 0))) / _scale)
     ui_state = userdata.get("state")
     buttons = userdata.get("buttons")
     if not isinstance(ui_state, dict) or not isinstance(buttons, list):
@@ -1231,6 +1289,7 @@ def create_runtime_ui_state(config: SimulationConfig) -> dict:
         "observation_boxes": bool(config.show_observation_boxes),
         "autonomous_mode": False,
         "kalman_on": bool(config.kalman_enabled),
+        "ref_patch": False,
         "_panel_collapsed": True,
         "_hover_key": None,
         "_dirty": True,
@@ -1258,6 +1317,8 @@ def apply_runtime_ui_hotkey(key: int, ui_state: dict) -> bool:
         ord("P"): "autonomous_mode",
         ord("k"): "kalman_on",
         ord("K"): "kalman_on",
+        ord("m"): "ref_patch",
+        ord("M"): "ref_patch",
     }
     target = hotkey_map.get(key)
     if target is None:
@@ -1874,40 +1935,62 @@ def resize_to_fit(image: np.ndarray, target_width: int, target_height: int) -> n
 
 def get_dashboard_layout(
     config: SimulationConfig,
-) -> Tuple[Tuple[int, int, int, int], Tuple[int, int, int, int], Tuple[int, int, int, int]]:
+    show_ref_patch: bool = False,
+) -> Tuple[
+    Tuple[int, int, int, int],
+    Tuple[int, int, int, int],
+    Tuple[int, int, int, int],
+    Optional[Tuple[int, int, int, int]],
+    Tuple[int, int, int, int],
+]:
     dashboard_width, dashboard_height = config.display_size
     left_panel_width = int(dashboard_width * float(config.left_panel_width_ratio))
+    right_panel_width = int(config.right_info_panel_width)
+    # Harita: sol kolon + sağ telemetri kolonunu çıkar
+    # Kenar boşluğu yapısı: pad | sol | gap | harita | gap | sağ | pad
     map_width = (
         dashboard_width
-        - (3 * config.panel_padding)
-        - config.panel_gap
+        - (4 * config.panel_padding)
+        - (2 * config.panel_gap)
         - left_panel_width
+        - right_panel_width
     )
-    stacked_panel_height = (
-        dashboard_height
-        - (2 * config.panel_padding)
-        - config.panel_gap
-    ) // 2
-
-    observation_rect = (
-        config.panel_padding,
-        config.panel_padding,
-        left_panel_width,
-        stacked_panel_height,
-    )
-    template_rect = (
-        config.panel_padding,
-        config.panel_padding + stacked_panel_height + config.panel_gap,
-        left_panel_width,
-        stacked_panel_height,
-    )
+    map_x = config.panel_padding + left_panel_width + config.panel_gap
     map_rect = (
-        config.panel_padding + left_panel_width + config.panel_gap,
+        map_x,
         config.panel_padding,
         map_width,
         dashboard_height - (2 * config.panel_padding),
     )
-    return observation_rect, template_rect, map_rect
+    right_panel_rect = (
+        map_x + map_width + config.panel_gap,
+        config.panel_padding,
+        right_panel_width,
+        dashboard_height - (2 * config.panel_padding),
+    )
+
+    _ = show_ref_patch
+    panel_height = (
+        dashboard_height - 2 * config.panel_padding - 2 * config.panel_gap
+    ) // 3
+    observation_rect = (
+        config.panel_padding, config.panel_padding,
+        left_panel_width, panel_height,
+    )
+    template_rect = (
+        config.panel_padding,
+        config.panel_padding + panel_height + config.panel_gap,
+        left_panel_width,
+        panel_height,
+    )
+    ref_patch_rect: Optional[Tuple[int, int, int, int]] = (
+        config.panel_padding,
+        config.panel_padding + 2 * (panel_height + config.panel_gap),
+        left_panel_width,
+        panel_height,
+    )
+
+    return observation_rect, template_rect, map_rect, ref_patch_rect, right_panel_rect
 
 
 def get_panel_content_rect(
@@ -2369,14 +2452,9 @@ def create_observation_view(
     heading_degrees: float,
     ui_state: dict,
     config: SimulationConfig,
+    actual_crop: Optional[np.ndarray] = None,
 ) -> np.ndarray:
-    _ = (
-        actual_boxes,
-        actual_intersection_box,
-        observation_windows,
-        heading_degrees,
-        ui_state,
-    )
+    _ = (actual_boxes, actual_intersection_box, actual_crop, heading_degrees, ui_state)
     if len(observation_boxes) < 3:
         return np.zeros(
             (config.sample_window_size, config.sample_window_size, 3),
@@ -2396,9 +2474,16 @@ def create_observation_view(
 
     center_x = (canvas_width - hero_size) // 2
     top_y = padding
+
+    # Merkez gözlem penceresi (O2) yeşil kenarlıkla gösterilir
+    if len(observation_windows) >= 2 and observation_windows[1] is not None:
+        display_img = observation_windows[1]
+    else:
+        display_img = extract_padded_patch(observation_map, observation_boxes[1])
+
     cv2.putText(
         canvas,
-        "Mavi Pencere - Ham Raster Crop",
+        "Anlık Görüntü",
         (padding, top_y + 24),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.72,
@@ -2406,15 +2491,14 @@ def create_observation_view(
         2,
     )
     hero_y = top_y + title_height
-    raw_blue_window = extract_padded_patch(observation_map, observation_boxes[2])
     _draw_observation_tile(
         canvas,
-        raw_blue_window,
+        display_img,
         (center_x, hero_y),
         hero_size,
-        "O3",
-        TEMPLATE_COLORS[2],
-        "raw 544x544",
+        "O2",
+        (0, 204, 0),   # yeşil — actual_intersection_color ile aynı
+        format_patch_subtitle(1, altitude_state, config),
     )
 
     return canvas
@@ -2802,6 +2886,154 @@ def _draw_confidence_bar(
     )
 
 
+_TP_BG      = (42, 38, 37)     # C_CARD_BG  #252740 → BGR
+_TP_BORDER  = (85, 61, 58)     # C_BORDER   #3a3d55
+_TP_LABEL   = (158, 127, 123)  # C_MUTED    #7b7f9e
+_TP_VALUE   = (240, 234, 232)  # C_TEXT     #e8eaf0
+_TP_ACCENT  = (244, 133, 66)   # C_ACCENT   #4285f4
+_TP_SUCCESS = (80, 175, 76)    # C_SUCCESS  #4caf50
+_TP_WARN    = (0, 152, 255)    # C_WARN     #ff9800
+_TP_DANGER  = (68, 68, 244)    # red        #f44336
+_TP_PANEL_W = 180              # sağ panel genişliği (piksel) — config.right_info_panel_width ile eşleşmeli
+
+
+def _draw_metric_card(
+    canvas: np.ndarray,
+    x: int,
+    y: int,
+    w: int,
+    h: int,
+    label: str,
+    value: str,
+    value_color: Tuple[int, int, int] = _TP_VALUE,
+    label_color: Tuple[int, int, int] = _TP_LABEL,
+) -> None:
+    _draw_alpha_rounded_panel(canvas, x, y, x + w, y + h, 7, _TP_BG, 0.88)
+    _draw_rounded_rect(canvas, x, y, x + w, y + h, 7, _TP_BORDER, 1)
+    cv2.putText(
+        canvas, label, (x + 9, y + 18),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.44, label_color, 1, cv2.LINE_AA,
+    )
+    cv2.putText(
+        canvas, value, (x + 9, y + h - 9),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.78, value_color, 2, cv2.LINE_AA,
+    )
+
+
+def draw_right_telemetry_panel(
+    canvas: np.ndarray,
+    panel_rect: Tuple[int, int, int, int],
+    heading_degrees: float,
+    altitude_state: "AltitudeSimulationState",
+    error_pixels: float,
+    step_count: int,
+    last_action: str,
+    score_values: List[float],
+    intersection_mode: str,
+    search_window_size: int,
+    ui_state: dict,
+    config: "SimulationConfig",
+    quality: Optional["LocalizationQuality"] = None,
+    kalman_error_pixels: Optional[float] = None,
+    autonomous_mode: bool = False,
+    waypoint_distance_px: Optional[float] = None,
+) -> None:
+    px, py, pw, ph = panel_rect
+
+    # Panel arka planı
+    _draw_alpha_rounded_panel(canvas, px, py, px + pw, py + ph, 10, (30, 28, 26), 0.82)
+    _draw_rounded_rect(canvas, px, py, px + pw, py + ph, 10, _TP_BORDER, 1)
+
+    # Başlık
+    title = "OTONOM" if autonomous_mode else "NAVIGASYON"
+    title_color = _TP_SUCCESS if autonomous_mode else _TP_ACCENT
+    cv2.putText(
+        canvas, title, (px + 12, py + 22),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.60, title_color, 2, cv2.LINE_AA,
+    )
+    sep_y = py + 30
+    cv2.line(canvas, (px + 8, sep_y), (px + pw - 8, sep_y), _TP_BORDER, 1, cv2.LINE_AA)
+
+    gsd_cm = (
+        altitude_state.center_gsd_cm_per_px
+        if altitude_state.center_gsd_cm_per_px > 0.0
+        else float(config.reference_map_gsd_cm_per_px)
+    )
+    error_m = error_pixels * gsd_cm / 100.0
+
+    # Hata rengini belirle
+    if error_m < 30:
+        err_color = _TP_SUCCESS
+    elif error_m < 80:
+        err_color = _TP_WARN
+    else:
+        err_color = _TP_DANGER
+
+    # Güven rengi
+    if quality is not None:
+        conf_pct = quality.confidence * 100.0
+        conf_color = _TP_SUCCESS if quality.is_reliable else (_TP_WARN if conf_pct >= 40 else _TP_DANGER)
+        conf_str = "%.0f%%" % conf_pct
+    else:
+        conf_color = _TP_LABEL
+        conf_str = "--"
+
+    # Kartlar — 2 sütunlu ızgara
+    card_h   = 52
+    card_gap = 6
+    cw2      = (pw - 12 - card_gap) // 2   # tek kart genişliği (2 sütun)
+    cw1      = pw - 12                      # tam genişlik kart
+
+    cards_2col = [
+        ("HDG", format_heading_label(heading_degrees), _TP_VALUE),
+        ("ALT", "%.0fm" % altitude_state.altitude_agl_m, _TP_VALUE),
+        ("GSD", "%.1fcm" % gsd_cm, _TP_VALUE),
+        ("ERR", "%.1fm" % error_m, err_color),
+        ("ADIM", str(step_count), _TP_VALUE),
+        ("GUVEN", conf_str, conf_color),
+    ]
+
+    cx0 = py + 38
+    for i, (lbl, val, col) in enumerate(cards_2col):
+        row = i // 2
+        col_idx = i % 2
+        cx = px + 6 + col_idx * (cw2 + card_gap)
+        cy = cx0 + row * (card_h + card_gap)
+        _draw_metric_card(canvas, cx, cy, cw2, card_h, lbl, val, col)
+
+    # Tam genişlik kartlar (ISC, ROI, CMD)
+    full_y = cx0 + 3 * (card_h + card_gap)
+    full_cards = [
+        ("ISC", intersection_mode, _TP_VALUE),
+        ("ROI", "%d px" % search_window_size, _TP_VALUE),
+        ("CMD", get_action_label(last_action), _TP_VALUE),
+    ]
+    if waypoint_distance_px is not None:
+        wpt_m = waypoint_distance_px * gsd_cm / 100.0
+        full_cards.insert(0, ("WPT", "%.0fm" % wpt_m, _TP_SUCCESS))
+
+    for lbl, val, col in full_cards:
+        _draw_metric_card(canvas, px + 6, full_y, cw1, card_h - 8, lbl, val, col)
+        full_y += (card_h - 8) + card_gap
+
+    # Skor çubukları
+    full_y += 4
+    if full_y + 60 < py + ph:
+        cv2.putText(
+            canvas, "SKORLAR", (px + 12, full_y + 12),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.40, _TP_LABEL, 1, cv2.LINE_AA,
+        )
+        _draw_score_bars(canvas, score_values, px + 12, full_y + 18)
+
+    # Güven çubuğu
+    if quality is not None:
+        bar_y = full_y + 18 + 3 * 14 + 14
+        if bar_y + 20 < py + ph:
+            _draw_confidence_bar(
+                canvas, quality.confidence, quality.is_reliable, px + 12, bar_y,
+            )
+
+
 def draw_hud(
     canvas: np.ndarray,
     map_rect: Tuple[int, int, int, int],
@@ -2827,79 +3059,24 @@ def draw_hud(
 ) -> None:
     x, y, width, height = map_rect
 
-    if ui_state.get("info_panel", True):
-        gsd_cm = (
-            altitude_state.center_gsd_cm_per_px
-            if altitude_state.center_gsd_cm_per_px > 0.0
-            else float(config.reference_map_gsd_cm_per_px)
-        )
-        error_m = error_pixels * gsd_cm / 100.0
-        hud_lines = [
-            "SCN: %s" % get_scenario_label(config),
-            "HDG: %s" % format_heading_label(heading_degrees),
-            "ERR: %.1f m" % error_m,
-        ]
-        kalman_runtime_on = bool(ui_state.get("kalman_on", config.kalman_enabled))
-        if kalman_error_pixels is not None and kalman_runtime_on:
-            hud_lines.append("KLM: %.1f m" % (kalman_error_pixels * gsd_cm / 100.0))
-        elif not kalman_runtime_on:
-            hud_lines.append("KLM: KAPALI")
-        if is_altitude_scenario(config):
-            hud_lines.insert(2, "ALT: %.1f m AGL" % altitude_state.altitude_agl_m)
-            hud_lines.insert(3, "GSD: %.2f cm/px" % altitude_state.center_gsd_cm_per_px)
-        hud_lines += [
-            "ISC: %s" % intersection_mode,
-            "ROI: %d px" % search_window_size,
-            "CMD: %s" % get_action_label(last_action),
-        ]
-        if autonomous_mode:
-            hud_lines.insert(0, ">>> OTONOM <<<")
-            if waypoint_distance_px is not None:
-                wpt_m = waypoint_distance_px * gsd_cm / 100.0
-                hud_lines.insert(1, "WPT: %.0f m" % wpt_m)
-        draw_info_panel(
-            canvas,
-            hud_lines,
-            top_left=(x + 28, y + 96),
-            font_scale=0.90,
-            thickness=2,
-            alpha=0.58,
-            padding=18,
-            corner_radius=18,
-        )
-
-        # Skor çubukları
-        bar_x = x + 28
-        bar_y = y + 96 + len(hud_lines) * 26 + 18
-        _draw_score_bars(canvas, score_values, bar_x, bar_y)
-
-        # Güven çubuğu
-        if quality is not None:
-            _draw_confidence_bar(
-                canvas,
-                quality.confidence,
-                quality.is_reliable,
-                bar_x,
-                bar_y + 3 * 14 + 14,
-            )
-
-    # Otonom mod büyük göstergesi (sağ üst köşe)
-    if autonomous_mode:
-        label = "OTONOM"
-        font_scale = 0.90
-        thickness = 2
-        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
-        badge_x = x + width - tw - 28
-        badge_y = y + 14
-        _draw_alpha_rounded_panel(canvas, badge_x - 10, badge_y - th - 6, badge_x + tw + 10,
-                                  badge_y + 8, 8, (0, 140, 20), 0.75)
-        cv2.putText(canvas, label, (badge_x, badge_y),
-                    cv2.FONT_HERSHEY_SIMPLEX, font_scale, (80, 255, 120), thickness, cv2.LINE_AA)
-
     help_line_1 = "WASD hareket | Q/E donus | P otonom"
     if is_altitude_scenario(config):
         help_line_1 += " | +/- irtifa"
     help_line_2 = "H panel | B bilgi | T iz | O ROI | R TM | Y yon | G gozlem | ESC/X cikis"
+    _hl1_w, _hl1_h = cv2.getTextSize(
+        help_line_1, cv2.FONT_HERSHEY_SIMPLEX, 0.52, 2
+    )[0]
+    _hl2_w, _hl2_h = cv2.getTextSize(
+        help_line_2, cv2.FONT_HERSHEY_SIMPLEX, 0.48, 2
+    )[0]
+    _help_bg_x0 = x + 8
+    _help_bg_y0 = y + height - _hl1_h - _hl2_h - 28
+    _help_bg_x1 = min(x + width - 4, x + 8 + max(_hl1_w, _hl2_w) + 8)
+    _help_bg_y1 = y + height - 4
+    _draw_alpha_rounded_panel(
+        canvas, _help_bg_x0, _help_bg_y0, _help_bg_x1, _help_bg_y1,
+        6, (20, 22, 30), 0.60,
+    )
     cv2.putText(
         canvas,
         help_line_1,
@@ -2908,6 +3085,7 @@ def draw_hud(
         0.52,
         config.panel_title_color,
         2,
+        cv2.LINE_AA,
     )
     cv2.putText(
         canvas,
@@ -2917,6 +3095,7 @@ def draw_hud(
         0.48,
         config.panel_title_color,
         2,
+        cv2.LINE_AA,
     )
 
 
@@ -2951,6 +3130,9 @@ def draw_localization_dashboard(
     quality: Optional[LocalizationQuality] = None,
     kalman_error_pixels: Optional[float] = None,
     waypoint_distance_px: Optional[float] = None,
+    ref_patch_image: Optional[np.ndarray] = None,
+    ref_patch_rect: Optional[Tuple[int, int, int, int]] = None,
+    right_panel_rect: Optional[Tuple[int, int, int, int]] = None,
 ) -> np.ndarray:
     dashboard_width, dashboard_height = config.display_size
     canvas = np.full(
@@ -3109,6 +3291,21 @@ def draw_localization_dashboard(
         config.template_panel_title,
         config,
     )
+    if ref_patch_rect is not None:
+        if ref_patch_image is not None:
+            _rp_img = (
+                ref_patch_image if ref_patch_image.ndim == 3
+                else cv2.cvtColor(ref_patch_image, cv2.COLOR_GRAY2BGR)
+            )
+        else:
+            _rp_img = np.full(
+                (config.sample_window_size, config.sample_window_size, 3),
+                config.panel_background_color,
+                dtype=np.uint8,
+            )
+        draw_panel(canvas, _rp_img, ref_patch_rect, "Eşleşen Bölge (O2)", config)
+        _rpx, _rpy, _rpw, _rph = ref_patch_rect
+        cv2.rectangle(canvas, (_rpx, _rpy), (_rpx + _rpw, _rpy + _rph), (0, 204, 0), 2)
     draw_panel_frame(canvas, map_rect, config.reference_panel_title, config)
     canvas[
         reference_preview_state.paste_y : reference_preview_state.paste_y
@@ -3117,6 +3314,7 @@ def draw_localization_dashboard(
         + reference_preview_state.preview_width,
     ] = preview
 
+    _err_px = compute_error_pixels(predicted_center, actual_center)
     draw_hud(
         canvas,
         map_rect,
@@ -3124,7 +3322,7 @@ def draw_localization_dashboard(
         observation_cursor,
         predicted_center,
         actual_center,
-        compute_error_pixels(predicted_center, actual_center),
+        _err_px,
         kalman_error_pixels=kalman_error_pixels,
         step_count=step_count,
         last_action=last_action,
@@ -3137,6 +3335,27 @@ def draw_localization_dashboard(
         ui_state=ui_state,
         config=config,
         quality=quality,
+        autonomous_mode=autonomous_mode,
+        waypoint_distance_px=waypoint_distance_px,
+    )
+    _rp_rect = right_panel_rect if right_panel_rect is not None else (
+        map_rect[0] + map_rect[2] + 4, map_rect[1], _TP_PANEL_W, map_rect[3]
+    )
+    draw_right_telemetry_panel(
+        canvas,
+        _rp_rect,
+        heading_degrees=heading_degrees,
+        altitude_state=altitude_state,
+        error_pixels=_err_px,
+        step_count=step_count,
+        last_action=last_action,
+        score_values=score_values,
+        intersection_mode=intersection_mode,
+        search_window_size=search_window_size,
+        ui_state=ui_state,
+        config=config,
+        quality=quality,
+        kalman_error_pixels=kalman_error_pixels,
         autonomous_mode=autonomous_mode,
         waypoint_distance_px=waypoint_distance_px,
     )
@@ -3354,9 +3573,16 @@ def choose_initial_cursor(
     )
 
 
-def main() -> None:
-    config = SimulationConfig()
-    config = _apply_args_to_config(config, _parse_args())
+def main(
+    config=None,
+    _display_fn=None,
+    _getkey_fn=None,
+    _use_qt: bool = False,
+    _ctx_holder=None,
+) -> None:
+    if config is None:
+        config = SimulationConfig()
+        config = _apply_args_to_config(config, _parse_args())
     reference_map, observation_map, model = load_assets(config)
     terrain_context: Optional[TerrainContext] = None
 
@@ -3371,7 +3597,7 @@ def main() -> None:
             if config.diagnostic_benchmark_only:
                 return
 
-        observation_rect, template_rect, map_rect = get_dashboard_layout(config)
+        observation_rect, template_rect, map_rect, ref_patch_rect, right_panel_rect = get_dashboard_layout(config)
 
         row, col = choose_initial_cursor(observation_map.shape, config)
         predicted_history: List[Tuple[int, int]] = []
@@ -3387,27 +3613,32 @@ def main() -> None:
 
         runtime_ui_state = create_runtime_ui_state(config)
         runtime_ui_buttons = _build_runtime_buttons() if config.ui_buttons_enabled else []
+        _lb_state: dict = {"scale": 1.0, "x_off": 0, "y_off": 0}
         runtime_ui_context: dict = {
             "state": runtime_ui_state,
             "buttons": runtime_ui_buttons,
             "reference_preview_state": None,
             "waypoint_target": None,
+            "_lb": _lb_state,
         }
+        if _ctx_holder is not None:
+            _ctx_holder[0] = runtime_ui_context
 
         csv_writer, csv_file = _open_csv_log(config)
 
         try:
-            cv2.namedWindow(config.dashboard_window_name, cv2.WINDOW_NORMAL)
-            cv2.resizeWindow(
-                config.dashboard_window_name,
-                config.display_size[0],
-                config.display_size[1],
-            )
-            cv2.setMouseCallback(
-                config.dashboard_window_name,
-                _runtime_buttons_mouse_cb,
-                runtime_ui_context,
-            )
+            if not _use_qt:
+                cv2.namedWindow(config.dashboard_window_name, cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
+                cv2.resizeWindow(
+                    config.dashboard_window_name,
+                    config.display_size[0],
+                    config.display_size[1],
+                )
+                cv2.setMouseCallback(
+                    config.dashboard_window_name,
+                    _runtime_buttons_mouse_cb,
+                    runtime_ui_context,
+                )
 
             while True:
                 current_search_window_size = search_window_size
@@ -3541,6 +3772,22 @@ def main() -> None:
                     reference_map.shape, display_predicted_center, search_window_size,
                 )
 
+                # Ref-patch toggle'a göre layout yeniden hesapla
+                _show_ref_patch = bool(runtime_ui_state.get("ref_patch", False))
+                observation_rect, template_rect, map_rect, ref_patch_rect, right_panel_rect = get_dashboard_layout(
+                    config, _show_ref_patch,
+                )
+                # Haritada yeşil (O2) eşleşmesinin bulduğu bölgeyi her adımda çıkar
+                ref_patch_image: Optional[np.ndarray] = None
+                if len(matched_boxes) >= 2:
+                    _bx, _by, _bw, _bh = matched_boxes[1]
+                    _ref_crop = reference_map[
+                        max(0, _by) : min(reference_map.shape[0], _by + _bh),
+                        max(0, _bx) : min(reference_map.shape[1], _bx + _bw),
+                    ]
+                    if _ref_crop.size > 0:
+                        ref_patch_image = _ref_crop.copy()
+
                 reference_viewport_box = get_reference_viewport_box(
                     reference_map.shape, predicted_intersection_box,
                     actual_intersection_box, display_search_window_box, search_mode, config,
@@ -3603,20 +3850,26 @@ def main() -> None:
                     quality=quality,
                     kalman_error_pixels=kalman_error_pixels,
                     waypoint_distance_px=waypoint_distance_px,
+                    ref_patch_image=ref_patch_image,
+                    ref_patch_rect=ref_patch_rect,
+                    right_panel_rect=right_panel_rect,
                 )
                 dashboard = draw_localization_dashboard(**_dash_kw)
 
                 # --- İç döngü: tuş bekleme / otonom adım ---
                 should_exit = False
                 while True:
-                    cv2.imshow(config.dashboard_window_name, dashboard)
+                    if _display_fn is not None:
+                        _display_fn(dashboard, _lb_state)
+                    else:
+                        _imshow_keepratio(config.dashboard_window_name, dashboard, _lb_state)
                     runtime_ui_state["_dirty"] = False
                     wait_ms = (
                         config.autonomous_step_interval_ms
                         if bool(runtime_ui_state.get("autonomous_mode", False))
                         else 30
                     )
-                    key = cv2.waitKeyEx(wait_ms)
+                    key = _getkey_fn(wait_ms) if _getkey_fn is not None else cv2.waitKeyEx(wait_ms)
 
                     if runtime_ui_state.get("_dirty"):
                         # waypoint veya toggle değişmiş olabilir
@@ -3636,8 +3889,8 @@ def main() -> None:
                         # Kalman toggle: bir sonraki adımda kalman bloğu sıfırlanacak;
                         # şimdilik HUD'ı güncelle
                         dashboard = draw_localization_dashboard(**_dash_kw)
-                        # Kalman K tuşuyla değişmişse hemen sonraki adıma geç
-                        if key in KALMAN_TOGGLE_KEYS:
+                        # Kalman veya ref-patch toggle → layout değişir, hemen sonraki adıma geç
+                        if key in KALMAN_TOGGLE_KEYS or key in REF_PATCH_TOGGLE_KEYS:
                             step_count += 1
                             break
                         continue
@@ -3687,8 +3940,165 @@ def main() -> None:
 
     finally:
         close_terrain_context(terrain_context)
-        cv2.destroyAllWindows()
+        if not _use_qt:
+            cv2.destroyAllWindows()
+
+
+# ---------------------------------------------------------------------------
+# PyQt5 UI classes
+# ---------------------------------------------------------------------------
+
+if _HAS_QT:
+    class DashboardLabel(QLabel):
+        mouse_pressed = pyqtSignal(int, int)
+        mouse_moved = pyqtSignal(int, int)
+
+        def __init__(self, parent=None):
+            super().__init__(parent)
+            self.setAlignment(Qt.AlignCenter)
+            self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+            self.setMinimumSize(400, 400)
+            self.setStyleSheet("background: black;")
+            self._orig_pixmap = None
+            self._img_w = 1
+            self._img_h = 1
+
+        def set_frame(self, bgr_array: np.ndarray) -> None:
+            h, w = bgr_array.shape[:2]
+            self._img_w = w
+            self._img_h = h
+            rgb = cv2.cvtColor(bgr_array, cv2.COLOR_BGR2RGB)
+            q_img = QImage(rgb.data, w, h, w * 3, QImage.Format_RGB888).copy()
+            self._orig_pixmap = QPixmap.fromImage(q_img)
+            self._refresh()
+
+        def _refresh(self) -> None:
+            if self._orig_pixmap is not None:
+                self.setPixmap(
+                    self._orig_pixmap.scaled(
+                        self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation,
+                    )
+                )
+
+        def resizeEvent(self, event):
+            super().resizeEvent(event)
+            self._refresh()
+
+        def _to_image_coords(self, wx: int, wy: int):
+            pm = self.pixmap()
+            if pm is None or pm.isNull():
+                return wx, wy
+            pw, ph = pm.width(), pm.height()
+            if pw <= 0 or ph <= 0:
+                return wx, wy
+            x_off = (self.width() - pw) // 2
+            y_off = (self.height() - ph) // 2
+            ix = int((wx - x_off) * self._img_w / pw)
+            iy = int((wy - y_off) * self._img_h / ph)
+            return ix, iy
+
+        def mousePressEvent(self, event):
+            ix, iy = self._to_image_coords(event.x(), event.y())
+            self.mouse_pressed.emit(ix, iy)
+
+        def mouseMoveEvent(self, event):
+            ix, iy = self._to_image_coords(event.x(), event.y())
+            self.mouse_moved.emit(ix, iy)
+
+    class SimulationWorker(QThread):
+        frame_ready = pyqtSignal(object)
+
+        def __init__(self, config=None):
+            super().__init__()
+            self._config = config
+            self._key_q: _queue.Queue = _queue.Queue()
+            self._ctx_holder = [None]
+
+        def post_key(self, cv2_key: int) -> None:
+            self._key_q.put(cv2_key)
+
+        def _display_fn(self, image: np.ndarray, lb_state: dict) -> None:
+            lb_state.update(scale=1.0, x_off=0, y_off=0)
+            self.frame_ready.emit(image.copy())
+
+        def _getkey_fn(self, wait_ms: int) -> int:
+            try:
+                return self._key_q.get(timeout=wait_ms / 1000.0)
+            except _queue.Empty:
+                return -1
+
+        def run(self) -> None:
+            main(
+                config=self._config,
+                _display_fn=self._display_fn,
+                _getkey_fn=self._getkey_fn,
+                _use_qt=True,
+                _ctx_holder=self._ctx_holder,
+            )
+
+    class SimulationWindow(QMainWindow):
+        def __init__(self, config=None):
+            super().__init__()
+            self._config = config
+            self._worker = SimulationWorker(config)
+            w = config.display_size[0] if config else 1000
+            h = config.display_size[1] if config else 1000
+            self.setWindowTitle("GPS-Denied Lokalizasyon Simülasyonu")
+            self.resize(w, h)
+            self._label = DashboardLabel()
+            self.setCentralWidget(self._label)
+            self._worker.frame_ready.connect(self._label.set_frame)
+            self._label.mouse_pressed.connect(self._on_press)
+            self._label.mouse_moved.connect(self._on_move)
+
+        def _ctx(self):
+            return self._worker._ctx_holder[0]
+
+        def _on_press(self, x: int, y: int) -> None:
+            ctx = self._ctx()
+            if ctx is not None:
+                _runtime_buttons_mouse_cb(cv2.EVENT_LBUTTONDOWN, x, y, 0, ctx)
+
+        def _on_move(self, x: int, y: int) -> None:
+            ctx = self._ctx()
+            if ctx is not None:
+                _runtime_buttons_mouse_cb(cv2.EVENT_MOUSEMOVE, x, y, 0, ctx)
+
+        def keyPressEvent(self, event) -> None:
+            qt_key = event.key()
+            cv2_key = _QT_KEY_MAP.get(qt_key)
+            if cv2_key is None:
+                text = event.text()
+                if text and len(text) == 1 and 32 <= ord(text) < 128:
+                    cv2_key = ord(text)
+                else:
+                    cv2_key = qt_key
+            self._worker.post_key(cv2_key)
+
+        def showEvent(self, event) -> None:
+            super().showEvent(event)
+            if not self._worker.isRunning():
+                self._worker.start()
+
+        def closeEvent(self, event) -> None:
+            self._worker.post_key(27)
+            self._worker.wait(4000)
+            event.accept()
+
+
+def main_qt(config=None) -> None:
+    if not _HAS_QT:
+        print("PyQt5 bulunamadı, OpenCV moduna geçiliyor.")
+        main(config=config)
+        return
+    app = QApplication.instance() or QApplication(_sys.argv)
+    if config is None:
+        config = SimulationConfig()
+        config = _apply_args_to_config(config, _parse_args())
+    win = SimulationWindow(config=config)
+    win.show()
+    _sys.exit(app.exec_())
 
 
 if __name__ == "__main__":
-    main()
+    main_qt()
