@@ -32,6 +32,86 @@ try:
 except ImportError:
     _HAS_QT = False
 
+try:
+    from PIL import ImageFont as _PILFont, ImageDraw as _PILDraw, Image as _PILImg
+    _HAS_PIL = True
+    _PIL_FONT_PATHS = [
+        "C:/Windows/Fonts/segoeui.ttf",
+        "C:/Windows/Fonts/calibri.ttf",
+        "C:/Windows/Fonts/arial.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/System/Library/Fonts/Supplemental/Arial.ttf",
+    ]
+    _pil_font_cache: dict = {}
+
+    def _get_pil_font(size_px: int):
+        if size_px not in _pil_font_cache:
+            for _fp in _PIL_FONT_PATHS:
+                if os.path.exists(_fp):
+                    try:
+                        _pil_font_cache[size_px] = _PILFont.truetype(_fp, size_px)
+                        break
+                    except Exception:
+                        continue
+            else:
+                _pil_font_cache[size_px] = _PILFont.load_default()
+        return _pil_font_cache[size_px]
+
+except ImportError:
+    _HAS_PIL = False
+
+_TR_ASCII = str.maketrans(
+    "şıığüöçŞİĞÜÖÇ",
+    "siiguocSIGUOC",
+)
+
+
+def _put_text_tr(canvas, text: str, baseline_xy: tuple, size_px: int, color: tuple, thickness: int = 1) -> None:
+    """cv2.putText wrapper with Unicode support via PIL (Turkish chars)."""
+    needs_unicode = any(ord(c) > 127 for c in text)
+    if _HAS_PIL and needs_unicode:
+        x0, y0 = baseline_xy
+        font = _get_pil_font(size_px)
+        try:
+            bbox = font.getbbox(text)
+            off_x, off_y = -bbox[0], -bbox[1]
+            tw = bbox[2] - bbox[0]
+            th = bbox[3] - bbox[1]
+        except AttributeError:
+            tw, th = font.getsize(text)
+            off_x, off_y = 0, 0
+        try:
+            ascent = font.getmetrics()[0]
+        except Exception:
+            ascent = size_px
+        draw_y = y0 - ascent
+        cx0 = max(0, x0 - 2)
+        cy0 = max(0, draw_y - 2)
+        cx1 = min(canvas.shape[1], x0 + tw + 4)
+        cy1 = min(canvas.shape[0], draw_y + th + 4)
+        if cx0 >= cx1 or cy0 >= cy1:
+            return
+        patch = canvas[cy0:cy1, cx0:cx1]
+        pil = _PILImg.fromarray(cv2.cvtColor(patch, cv2.COLOR_BGR2RGB))
+        _PILDraw.Draw(pil).text(
+            (x0 - cx0 + off_x, draw_y - cy0 + off_y),
+            text,
+            fill=(color[2], color[1], color[0]),
+            font=font,
+        )
+        canvas[cy0:cy1, cx0:cx1] = cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
+        return
+    cv2.putText(
+        canvas,
+        text.translate(_TR_ASCII),
+        baseline_xy,
+        cv2.FONT_HERSHEY_SIMPLEX,
+        size_px / 28.0,
+        color,
+        thickness,
+        cv2.LINE_AA,
+    )
+
 from gps_denied_autonomy import (
     LocalizationQuality,
     choose_autonomous_action,
@@ -155,8 +235,8 @@ class SimulationConfig:
     predicted_intersection_color: Tuple[int, int, int] = (0, 215, 255)
     error_line_color: Tuple[int, int, int] = (255, 255, 0)
     dashboard_window_name: str = "Dashboard"
-    observation_panel_title: str = "Gozlem Alani"
-    template_panel_title: str = "Merkez Model Ciktisi"
+    observation_panel_title: str = "Anlık Görüntü"
+    template_panel_title: str = "Model Çıktısı"
     reference_panel_title: str = "Referans Harita"
     panel_padding: int = 20
     panel_gap: int = 20
@@ -2011,31 +2091,22 @@ def draw_panel_frame(
     panel_rect: Tuple[int, int, int, int],
     title: str,
     config: SimulationConfig,
+    accent_color: Optional[Tuple[int, int, int]] = None,
 ) -> None:
     x, y, width, height = panel_rect
-    cv2.rectangle(
-        canvas,
-        (x, y),
-        (x + width, y + height),
-        config.panel_background_color,
-        -1,
-    )
-    cv2.rectangle(
-        canvas,
-        (x, y),
-        (x + width, y + height),
-        config.panel_border_color,
-        2,
-    )
-    cv2.putText(
-        canvas,
-        title,
-        (x + 12, y + 26),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.75,
-        config.panel_title_color,
-        2,
-    )
+    hdr_h = config.panel_title_height
+    # Panel background
+    cv2.rectangle(canvas, (x, y), (x + width, y + height), config.panel_background_color, -1)
+    # Header background — slightly lighter strip
+    hdr_bg = tuple(min(255, c + 14) for c in config.panel_background_color)
+    cv2.rectangle(canvas, (x, y), (x + width, y + hdr_h), hdr_bg, -1)
+    # Outer border
+    cv2.rectangle(canvas, (x, y), (x + width, y + height), config.panel_border_color, 1)
+    # Accent left bar (full height)
+    if accent_color is not None:
+        cv2.rectangle(canvas, (x, y), (x + 3, y + height), accent_color, -1)
+    title_x = x + (10 if accent_color is not None else 12)
+    _put_text_tr(canvas, title, (title_x, y + hdr_h - 8), 17, config.panel_title_color, 2)
 
 
 def draw_panel(
@@ -2044,8 +2115,9 @@ def draw_panel(
     panel_rect: Tuple[int, int, int, int],
     title: str,
     config: SimulationConfig,
+    accent_color: Optional[Tuple[int, int, int]] = None,
 ) -> None:
-    draw_panel_frame(canvas, panel_rect, title, config)
+    draw_panel_frame(canvas, panel_rect, title, config, accent_color=accent_color)
     content_x, content_y, content_width, content_height = get_panel_content_rect(
         panel_rect,
         config,
@@ -2462,18 +2534,14 @@ def create_observation_view(
         )
 
     hero_size = config.sample_window_size
-    padding = 16
-    title_height = 34
+    padding = 8
     canvas_width = hero_size
-    canvas_height = (padding * 2) + title_height + hero_size
+    canvas_height = padding * 2 + hero_size
     canvas = np.full(
         (canvas_height, canvas_width, 3),
         config.panel_background_color,
         dtype=np.uint8,
     )
-
-    center_x = (canvas_width - hero_size) // 2
-    top_y = padding
 
     # Merkez gözlem penceresi (O2) yeşil kenarlıkla gösterilir
     if len(observation_windows) >= 2 and observation_windows[1] is not None:
@@ -2481,23 +2549,13 @@ def create_observation_view(
     else:
         display_img = extract_padded_patch(observation_map, observation_boxes[1])
 
-    cv2.putText(
-        canvas,
-        "Anlık Görüntü",
-        (padding, top_y + 24),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.72,
-        config.panel_title_color,
-        2,
-    )
-    hero_y = top_y + title_height
     _draw_observation_tile(
         canvas,
         display_img,
-        (center_x, hero_y),
-        hero_size,
+        (padding, padding),
+        hero_size - padding * 2,
         "O2",
-        (0, 204, 0),   # yeşil — actual_intersection_color ile aynı
+        (0, 204, 0),
         format_patch_subtitle(1, altitude_state, config),
     )
 
@@ -2515,41 +2573,22 @@ def create_template_strip(
         )
 
     hero_size = config.sample_window_size
-    padding = 16
-    title_height = 34
-    strip_width = hero_size
-    strip_height = (padding * 2) + title_height + hero_size
-
+    padding = 8
     strip = np.full(
-        (strip_height, strip_width, 3),
+        (padding * 2 + hero_size, hero_size, 3),
         config.panel_background_color,
         dtype=np.uint8,
     )
 
-    blue_template = cv2.resize(
-        ensure_bgr(templates[2]),
-        (hero_size, hero_size),
+    tile_sz = hero_size - padding * 2
+    model_out = cv2.resize(
+        ensure_bgr(templates[1]),
+        (tile_sz, tile_sz),
         interpolation=cv2.INTER_AREA,
     )
-    tile_x = (strip_width - hero_size) // 2
-    tile_y = padding + title_height
-    strip[tile_y : tile_y + hero_size, tile_x : tile_x + hero_size] = blue_template
-    cv2.rectangle(
-        strip,
-        (tile_x, tile_y),
-        (tile_x + hero_size, tile_y + hero_size),
-        TEMPLATE_COLORS[2],
-        2,
-    )
-    cv2.putText(
-        strip,
-        "Mavi Pencere - Model Ciktisi",
-        (padding, padding + 24),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.62,
-        config.panel_title_color,
-        2,
-    )
+    strip[padding : padding + tile_sz, padding : padding + tile_sz] = model_out
+    cv2.rectangle(strip, (padding, padding), (padding + tile_sz, padding + tile_sz), (0, 204, 0), 2)
+    cv2.putText(strip, "O2", (padding + 8, padding + 24), cv2.FONT_HERSHEY_SIMPLEX, 0.68, (0, 204, 0), 2)
 
     return strip
 
@@ -2945,12 +2984,9 @@ def draw_right_telemetry_panel(
     _draw_rounded_rect(canvas, px, py, px + pw, py + ph, 10, _TP_BORDER, 1)
 
     # Başlık
-    title = "OTONOM" if autonomous_mode else "NAVIGASYON"
+    title = "OTONOM" if autonomous_mode else "NAVİGASYON"
     title_color = _TP_SUCCESS if autonomous_mode else _TP_ACCENT
-    cv2.putText(
-        canvas, title, (px + 12, py + 22),
-        cv2.FONT_HERSHEY_SIMPLEX, 0.60, title_color, 2, cv2.LINE_AA,
-    )
+    _put_text_tr(canvas, title, (px + 12, py + 22), 17, title_color, 2)
     sep_y = py + 30
     cv2.line(canvas, (px + 8, sep_y), (px + pw - 8, sep_y), _TP_BORDER, 1, cv2.LINE_AA)
 
@@ -3059,10 +3095,10 @@ def draw_hud(
 ) -> None:
     x, y, width, height = map_rect
 
-    help_line_1 = "WASD hareket | Q/E donus | P otonom"
+    help_line_1 = "WASD hareket  |  Q/E dönüş  |  P otonom"
     if is_altitude_scenario(config):
-        help_line_1 += " | +/- irtifa"
-    help_line_2 = "H panel | B bilgi | T iz | O ROI | R TM | Y yon | G gozlem | ESC/X cikis"
+        help_line_1 += "  |  +/- irtifa"
+    help_line_2 = "H panel  |  T iz  |  O ROI  |  R kutular  |  K Kalman  |  ESC/X çıkış"
     _hl1_w, _hl1_h = cv2.getTextSize(
         help_line_1, cv2.FONT_HERSHEY_SIMPLEX, 0.52, 2
     )[0]
@@ -3077,26 +3113,8 @@ def draw_hud(
         canvas, _help_bg_x0, _help_bg_y0, _help_bg_x1, _help_bg_y1,
         6, (20, 22, 30), 0.60,
     )
-    cv2.putText(
-        canvas,
-        help_line_1,
-        (x + 12, y + height - 36),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.52,
-        config.panel_title_color,
-        2,
-        cv2.LINE_AA,
-    )
-    cv2.putText(
-        canvas,
-        help_line_2,
-        (x + 12, y + height - 14),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.48,
-        config.panel_title_color,
-        2,
-        cv2.LINE_AA,
-    )
+    _put_text_tr(canvas, help_line_1, (x + 12, y + height - 36), 15, config.panel_title_color, 2)
+    _put_text_tr(canvas, help_line_2, (x + 12, y + height - 14), 14, config.panel_title_color, 1)
 
 
 def draw_localization_dashboard(
@@ -3277,20 +3295,10 @@ def draw_localization_dashboard(
             scaled_kc = scale_point_to_preview(kalman_center, reference_preview_state)
             cv2.line(preview, scaled_kc, scaled_wp, wp_color, 1, cv2.LINE_AA)
 
-    draw_panel(
-        canvas,
-        observation_view,
-        observation_rect,
-        config.observation_panel_title,
-        config,
-    )
-    draw_panel(
-        canvas,
-        template_strip,
-        template_rect,
-        config.template_panel_title,
-        config,
-    )
+    _GREEN = (0, 204, 0)
+    _BLUE = TEMPLATE_COLORS[2]
+    draw_panel(canvas, observation_view, observation_rect, config.observation_panel_title, config, accent_color=_GREEN)
+    draw_panel(canvas, template_strip, template_rect, config.template_panel_title, config, accent_color=_BLUE)
     if ref_patch_rect is not None:
         if ref_patch_image is not None:
             _rp_img = (
@@ -3303,9 +3311,7 @@ def draw_localization_dashboard(
                 config.panel_background_color,
                 dtype=np.uint8,
             )
-        draw_panel(canvas, _rp_img, ref_patch_rect, "Eşleşen Bölge (O2)", config)
-        _rpx, _rpy, _rpw, _rph = ref_patch_rect
-        cv2.rectangle(canvas, (_rpx, _rpy), (_rpx + _rpw, _rpy + _rph), (0, 204, 0), 2)
+        draw_panel(canvas, _rp_img, ref_patch_rect, "Eşleşen Bölge", config, accent_color=_GREEN)
     draw_panel_frame(canvas, map_rect, config.reference_panel_title, config)
     canvas[
         reference_preview_state.paste_y : reference_preview_state.paste_y
