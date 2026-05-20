@@ -144,9 +144,11 @@ EXIT_KEYS = (27, ord("x"), ord("X"))
 AUTONOMOUS_TOGGLE_KEYS = (ord("p"), ord("P"))
 KALMAN_TOGGLE_KEYS = (ord("k"), ord("K"))
 NORM_CYCLE_KEYS = (ord("n"), ord("N"))
+OBS_WINDOW_CYCLE_KEYS = (ord("v"), ord("V"))
 REF_PATCH_TOGGLE_KEYS = (ord("m"), ord("M"))
 
 _NORM_MODES = ("HAM", "CLAHE", "HISTEQ", "EDGE")
+_OBS_WINDOW_SMALL = 272
 
 
 def apply_observation_norm(image: np.ndarray, mode: str) -> np.ndarray:
@@ -1393,6 +1395,8 @@ def create_runtime_ui_state(config: SimulationConfig) -> dict:
         "autonomous_mode": False,
         "kalman_on": bool(config.kalman_enabled),
         "norm_mode": "HISTEQ",
+        "obs_window_size": config.sample_window_size,
+        "obs_272_mode": False,
         "ref_patch": False,
         "_panel_collapsed": True,
         "_hover_key": None,
@@ -1428,6 +1432,11 @@ def apply_runtime_ui_hotkey(key: int, ui_state: dict) -> bool:
         current = ui_state.get("norm_mode", "HAM")
         idx = _NORM_MODES.index(current) if current in _NORM_MODES else 0
         ui_state["norm_mode"] = _NORM_MODES[(idx + 1) % len(_NORM_MODES)]
+        ui_state["_dirty"] = True
+        return True
+    if key in OBS_WINDOW_CYCLE_KEYS:
+        ui_state["obs_272_mode"] = not bool(ui_state.get("obs_272_mode", False))
+        ui_state["obs_window_size"] = _OBS_WINDOW_SMALL if ui_state["obs_272_mode"] else 544
         ui_state["_dirty"] = True
         return True
     target = hotkey_map.get(key)
@@ -1523,9 +1532,13 @@ def get_template_boxes_from_observation_boxes(
     observation_boxes: List[Tuple[int, int, int, int]],
     config: SimulationConfig,
 ) -> List[Tuple[int, int, int, int]]:
-    inset = max(0, (config.sample_window_size - config.template_size) // 2)
+    # Pencere boyutu model girdisinden küçükse (272 modu), etkin ölçek != 1.
+    # Gerçek harita piksel cinsinden şablon boyutu: template_size × (sample/model) oranı.
+    scale = config.sample_window_size / float(config.model_input_size)
+    eff_size = max(1, int(round(config.template_size * scale)))
+    eff_inset = max(0, int(round(config.crop_margin * scale)))
     return [
-        (x + inset, y + inset, config.template_size, config.template_size)
+        (x + eff_inset, y + eff_inset, eff_size, eff_size)
         for x, y, _, _ in observation_boxes
     ]
 
@@ -1622,13 +1635,17 @@ def prepare_triplet_for_model(
 ) -> np.ndarray:
     prepared_windows = []
     for observation_window in observation_windows:
+        # Normalizasyonu resize öncesi uygula: doğal piksel histogramı korunur.
+        normed_src = apply_observation_norm(observation_window, norm_mode)
+        # Küçültmede INTER_AREA (antialias), büyütmede INTER_LINEAR (yumuşak).
+        src_size = max(normed_src.shape[0], normed_src.shape[1])
+        interp = cv2.INTER_AREA if src_size > config.model_input_size else cv2.INTER_LINEAR
         resized_window = cv2.resize(
-            observation_window,
+            normed_src,
             (config.model_input_size, config.model_input_size),
-            interpolation=cv2.INTER_NEAREST,
+            interpolation=interp,
         )
-        normed_window = apply_observation_norm(resized_window, norm_mode)
-        normalized_window = (normed_window.astype(np.float32) - 127.5) / 127.5
+        normalized_window = (resized_window.astype(np.float32) - 127.5) / 127.5
         prepared_windows.append(normalized_window)
 
     return np.stack(prepared_windows, axis=0).reshape(
@@ -1671,6 +1688,7 @@ def extract_template_triplet(
     model: object,
     config: SimulationConfig,
     norm_mode: str = "HISTEQ",
+    obs_window_size: Optional[int] = None,
 ) -> Tuple[
     List[np.ndarray],
     List[np.ndarray],
@@ -1680,6 +1698,8 @@ def extract_template_triplet(
     int,
     AltitudeSimulationState,
 ]:
+    if obs_window_size is not None and obs_window_size != config.sample_window_size:
+        config = dataclasses.replace(config, sample_window_size=obs_window_size)
     row, col = clamp_observation_cursor(row, col, observation_map.shape, config)
     observation_boxes = get_observation_boxes(row, col, heading_degrees, config)
     if is_altitude_scenario(config):
@@ -1934,21 +1954,41 @@ def localize_template_triplet(
     search_origin: Tuple[int, int],
     templates: List[np.ndarray],
     config: SimulationConfig,
+    match_downsample_size: int = 0,
 ) -> Tuple[List[float], List[Tuple[int, int, int, int]], Tuple[int, int, int, int], str, str]:
     scores = []
     matched_boxes = []
 
+    # Eşleştirme öncesi downsample (hız/hassasiyet dengesi)
+    ds_scale = 1.0
+    orig_template_sizes = [(t.shape[1], t.shape[0]) for t in templates]
+    if match_downsample_size > 0 and templates:
+        tpl_h, tpl_w = templates[0].shape[:2]
+        if max(tpl_h, tpl_w) > match_downsample_size:
+            ds_scale = match_downsample_size / float(max(tpl_h, tpl_w))
+            ds_tw = max(1, int(round(tpl_w * ds_scale)))
+            ds_th = max(1, int(round(tpl_h * ds_scale)))
+            ds_sw = max(ds_tw + 1, int(round(search_region.shape[1] * ds_scale)))
+            ds_sh = max(ds_th + 1, int(round(search_region.shape[0] * ds_scale)))
+            templates = [
+                cv2.resize(t, (ds_tw, ds_th), interpolation=cv2.INTER_AREA)
+                for t in templates
+            ]
+            search_region = cv2.resize(
+                search_region, (ds_sw, ds_sh), interpolation=cv2.INTER_AREA
+            )
+
     match_results, match_backend = match_three(search_region, templates, config)
 
-    for template, match_result in zip(templates, match_results):
+    for (orig_w, orig_h), match_result in zip(orig_template_sizes, match_results):
         score, local_top_left = match_result
         scores.append(score)
         matched_boxes.append(
             (
-                local_top_left[0] + search_origin[0],
-                local_top_left[1] + search_origin[1],
-                template.shape[1],
-                template.shape[0],
+                int(round(local_top_left[0] / ds_scale)) + search_origin[0],
+                int(round(local_top_left[1] / ds_scale)) + search_origin[1],
+                orig_w,
+                orig_h,
             )
         )
 
@@ -3090,9 +3130,12 @@ def draw_right_telemetry_panel(
     _klm_color = _TP_SUCCESS if _kalman_is_on else _TP_LABEL
     _norm_mode = ui_state.get("norm_mode", "HAM")
     _nrm_color = _TP_SUCCESS if _norm_mode != "HAM" else _TP_LABEL
+    _obs_272 = bool(ui_state.get("obs_272_mode", False))
+    _obw_color = _TP_SUCCESS if _obs_272 else _TP_LABEL
     full_cards = [
         ("KLM", _klm_val, _klm_color),
         ("NRM", _norm_mode, _nrm_color),
+        ("OBW", "272>256" if _obs_272 else "544 std", _obw_color),
         ("ISC", intersection_mode, _TP_VALUE),
         ("ROI", "%d px" % search_window_size, _TP_VALUE),
         ("CMD", get_action_label(last_action), _TP_VALUE),
@@ -3151,7 +3194,7 @@ def draw_hud(
     help_line_1 = "WASD hareket  |  Q/E dönüş  |  P otonom"
     if is_altitude_scenario(config):
         help_line_1 += "  |  +/- irtifa"
-    help_line_2 = "H panel  |  T iz  |  O ROI  |  R kutular  |  K Kalman  |  N norm  |  ESC/X çıkış"
+    help_line_2 = "H panel  |  T iz  |  O ROI  |  K Kalman  |  N norm  |  V 272-mod  |  ESC/X çıkış"
     _hl1_w, _hl1_h = cv2.getTextSize(
         help_line_1, cv2.FONT_HERSHEY_SIMPLEX, 0.52, 2
     )[0]
@@ -3717,6 +3760,7 @@ def main(
                     observation_map, row, col, heading_degrees,
                     altitude_agl_m, terrain_context, model, config,
                     norm_mode=runtime_ui_state.get("norm_mode", "HISTEQ"),
+                    obs_window_size=runtime_ui_state.get("obs_window_size", config.sample_window_size),
                 )
                 altitude_agl_m = altitude_state.altitude_agl_m
                 actual_intersection_box, _ = compute_intersection_box(actual_boxes)
@@ -3728,8 +3772,20 @@ def main(
                     reference_map, search_anchor_center, current_search_window_size,
                     step_count, config,
                 )
+                # 272 modunda: 512px şablonlar 272 harita pikselini temsil eder (2× zoom).
+                # Arama bölgesi 1:1 ölçekte kalmalı; yalnızca şablonlar 256px'e indirgenir.
+                _obs_272 = runtime_ui_state.get("obs_272_mode", False)
+                _match_templates = templates
+                if _obs_272:
+                    _eff_tpl = max(1, int(round(
+                        config.template_size * _OBS_WINDOW_SMALL / float(config.model_input_size)
+                    )))
+                    _match_templates = [
+                        cv2.resize(t, (_eff_tpl, _eff_tpl), interpolation=cv2.INTER_AREA)
+                        for t in templates
+                    ]
                 score_values, matched_boxes, predicted_intersection_box, intersection_mode, match_backend = (
-                    localize_template_triplet(search_region, search_origin, templates, config)
+                    localize_template_triplet(search_region, search_origin, _match_templates, config, 0)
                 )
 
                 raw_predicted_center = get_box_center(predicted_intersection_box)
