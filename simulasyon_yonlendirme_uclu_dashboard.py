@@ -701,6 +701,51 @@ def get_output_template_size(config: SimulationConfig) -> int:
     return config.model_input_size - (2 * config.crop_margin)
 
 
+def get_observation_model_scale(config: SimulationConfig) -> float:
+    return float(config.sample_window_size) / float(config.model_input_size)
+
+
+def _scale_model_pixels(value: float, config: SimulationConfig, minimum: int = 1) -> int:
+    return max(minimum, int(round(float(value) * get_observation_model_scale(config))))
+
+
+def get_effective_template_size(config: SimulationConfig) -> int:
+    return _scale_model_pixels(config.template_size, config)
+
+
+def get_effective_crop_margin(config: SimulationConfig) -> int:
+    return _scale_model_pixels(config.crop_margin, config, minimum=0)
+
+
+def get_effective_template_offset(config: SimulationConfig) -> int:
+    return _scale_model_pixels(config.template_offset, config)
+
+
+def resize_templates_to_effective_size(
+    templates: List[np.ndarray],
+    config: SimulationConfig,
+) -> List[np.ndarray]:
+    effective_size = get_effective_template_size(config)
+    if effective_size == config.template_size:
+        return templates
+    return [
+        cv2.resize(template, (effective_size, effective_size), interpolation=cv2.INTER_AREA)
+        for template in templates
+    ]
+
+
+def infer_matched_template_scale(
+    matched_boxes: List[Tuple[int, int, int, int]],
+    config: SimulationConfig,
+) -> float:
+    if not matched_boxes or config.template_size <= 0:
+        return 1.0
+    widths = [max(1, int(box[2])) for box in matched_boxes]
+    heights = [max(1, int(box[3])) for box in matched_boxes]
+    matched_size = (sum(widths) + sum(heights)) / float(2 * len(matched_boxes))
+    return max(0.05, float(matched_size) / float(config.template_size))
+
+
 def validate_config(config: SimulationConfig) -> None:
     normalize_scenario_mode(config.scenario_mode)
     output_template_size = get_output_template_size(config)
@@ -758,7 +803,7 @@ def get_action_label(action: str) -> str:
 
 
 def get_triplet_rotation_margin(config: SimulationConfig) -> int:
-    return int(config.template_offset)
+    return get_effective_template_offset(config)
 
 
 def get_scaled_observation_window_size(
@@ -1396,6 +1441,7 @@ def create_runtime_ui_state(config: SimulationConfig) -> dict:
         "kalman_on": bool(config.kalman_enabled),
         "norm_mode": "HISTEQ",
         "obs_window_size": config.sample_window_size,
+        "obs_window_default": config.sample_window_size,
         "obs_272_mode": False,
         "ref_patch": False,
         "_panel_collapsed": True,
@@ -1436,7 +1482,10 @@ def apply_runtime_ui_hotkey(key: int, ui_state: dict) -> bool:
         return True
     if key in OBS_WINDOW_CYCLE_KEYS:
         ui_state["obs_272_mode"] = not bool(ui_state.get("obs_272_mode", False))
-        ui_state["obs_window_size"] = _OBS_WINDOW_SMALL if ui_state["obs_272_mode"] else 544
+        default_window_size = int(ui_state.get("obs_window_default", 544))
+        ui_state["obs_window_size"] = (
+            _OBS_WINDOW_SMALL if ui_state["obs_272_mode"] else default_window_size
+        )
         ui_state["_dirty"] = True
         return True
     target = hotkey_map.get(key)
@@ -1515,7 +1564,7 @@ def get_observation_boxes(
     config: SimulationConfig,
 ) -> List[Tuple[int, int, int, int]]:
     size = config.sample_window_size
-    offset = config.template_offset
+    offset = get_effective_template_offset(config)
     # Offset vektörünü UAV başlık açısıyla döndür:
     # baseline her zaman gövde ekseniyle (diagonal forward-right) hizalı kalır
     raw_dx, raw_dy = rotate_image_offset(float(offset), float(offset), heading_degrees)
@@ -1532,11 +1581,10 @@ def get_template_boxes_from_observation_boxes(
     observation_boxes: List[Tuple[int, int, int, int]],
     config: SimulationConfig,
 ) -> List[Tuple[int, int, int, int]]:
-    # Pencere boyutu model girdisinden küçükse (272 modu), etkin ölçek != 1.
-    # Gerçek harita piksel cinsinden şablon boyutu: template_size × (sample/model) oranı.
-    scale = config.sample_window_size / float(config.model_input_size)
-    eff_size = max(1, int(round(config.template_size * scale)))
-    eff_inset = max(0, int(round(config.crop_margin * scale)))
+    # Pencere boyutu model girdisinden küçükse (272 modu), model çıktısındaki
+    # 512 px şablon gerçek haritada 256 px'e karşılık gelir.
+    eff_size = get_effective_template_size(config)
+    eff_inset = get_effective_crop_margin(config)
     return [
         (x + eff_inset, y + eff_inset, eff_size, eff_size)
         for x, y, _, _ in observation_boxes
@@ -2033,9 +2081,16 @@ def is_strict_triplet_alignment(
     midpoint_y = (center_a[1] + center_c[1]) / 2.0
     midpoint_error = math.hypot(center_b[0] - midpoint_x, center_b[1] - midpoint_y)
 
+    matched_template_scale = infer_matched_template_scale(matched_boxes, config)
+    expected_offset = float(config.template_offset) * matched_template_scale
+    alignment_tolerance = max(
+        8.0,
+        float(config.triplet_alignment_tolerance_px) * matched_template_scale,
+    )
+
     # Başlık açısına göre döndürülmüş beklenen delta
     exp_dx, exp_dy = rotate_image_offset(
-        float(config.template_offset), float(config.template_offset), heading_degrees
+        expected_offset, expected_offset, heading_degrees
     )
     step_error = max(
         abs(delta_ab_x - exp_dx),
@@ -2054,7 +2109,7 @@ def is_strict_triplet_alignment(
 
     alignment_error = max(midpoint_error, step_error, symmetry_error)
     return correct_direction and (
-        alignment_error <= float(config.triplet_alignment_tolerance_px)
+        alignment_error <= alignment_tolerance
     )
 
 
@@ -3748,6 +3803,13 @@ def main(
 
             while True:
                 current_search_window_size = search_window_size
+                runtime_obs_window_size = int(
+                    runtime_ui_state.get("obs_window_size", config.sample_window_size)
+                )
+                runtime_match_config = dataclasses.replace(
+                    config,
+                    sample_window_size=runtime_obs_window_size,
+                )
                 (
                     templates,
                     observation_windows,
@@ -3760,7 +3822,7 @@ def main(
                     observation_map, row, col, heading_degrees,
                     altitude_agl_m, terrain_context, model, config,
                     norm_mode=runtime_ui_state.get("norm_mode", "HISTEQ"),
-                    obs_window_size=runtime_ui_state.get("obs_window_size", config.sample_window_size),
+                    obs_window_size=runtime_obs_window_size,
                 )
                 altitude_agl_m = altitude_state.altitude_agl_m
                 actual_intersection_box, _ = compute_intersection_box(actual_boxes)
@@ -3772,18 +3834,12 @@ def main(
                     reference_map, search_anchor_center, current_search_window_size,
                     step_count, config,
                 )
-                # 272 modunda: 512px şablonlar 272 harita pikselini temsil eder (2× zoom).
-                # Arama bölgesi 1:1 ölçekte kalmalı; yalnızca şablonlar 256px'e indirgenir.
-                _obs_272 = runtime_ui_state.get("obs_272_mode", False)
-                _match_templates = templates
-                if _obs_272:
-                    _eff_tpl = max(1, int(round(
-                        config.template_size * _OBS_WINDOW_SMALL / float(config.model_input_size)
-                    )))
-                    _match_templates = [
-                        cv2.resize(t, (_eff_tpl, _eff_tpl), interpolation=cv2.INTER_AREA)
-                        for t in templates
-                    ]
+                # Arama bölgesi 1:1 ölçekte kalır; modelin 512 px çıktısı,
+                # aktif gözlem penceresinin gerçek harita ölçeğine indirilir.
+                _match_templates = resize_templates_to_effective_size(
+                    templates,
+                    runtime_match_config,
+                )
                 score_values, matched_boxes, predicted_intersection_box, intersection_mode, match_backend = (
                     localize_template_triplet(search_region, search_origin, _match_templates, config, 0)
                 )
