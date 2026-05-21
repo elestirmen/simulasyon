@@ -149,6 +149,10 @@ REF_PATCH_TOGGLE_KEYS = (ord("m"), ord("M"))
 
 _NORM_MODES = ("HAM", "CLAHE", "HISTEQ", "EDGE")
 _OBS_WINDOW_SMALL = 272
+MAP_DIRECTORY = Path("haritalar")
+MAP_FILE_SUFFIXES = (".tif", ".tiff", ".jpg", ".jpeg", ".png", ".bmp")
+MODEL_DIRECTORY = Path("model")
+MODEL_FILE_SUFFIXES = (".h5", ".hdf5", ".keras")
 
 
 def apply_observation_norm(image: np.ndarray, mode: str) -> np.ndarray:
@@ -203,16 +207,14 @@ UI_COLORS = {
 @dataclass(frozen=True)
 class SimulationConfig:
     scenario_mode: str = "normal"  # "normal" veya "irtifa"
-    reference_map_path: Path = Path(
-        "haritalar/ana_harita_urgup_30_cm__new_GPU_model_f32_k3_epoch_00001_sigmoid_(1_ 1)_06_10_2022.tif"
-    )
+    reference_map_path: Path = MAP_DIRECTORY
     observation_map_path: Path = Path("parcalar/urgup_bingmap_30cm_utm.tif")
     observation_georef_path: Path = Path("parcalar/urgup_bingmap_30cm_utm.tif")
     observation_grid_georef_path: Optional[Path] = Path(
         "haritalar/ana_harita_urgup_30_cm__new_GPU_model_f32_k3_epoch_00001_sigmoid_(1_ 1)_06_10_2022_son_model.h5.jpg_geo.tif_UTM_geo_r.tif"
     )
     dem_path: Path = Path("ana_harita_urgup_30_cm_utm_elevation.tif")
-    model_path: Path = Path("GPU_model_f32_k3_epoch_00001_sigmoid_(1_ 1)_06_10_2022_.h5")
+    model_path: Path = MODEL_DIRECTORY
     sample_window_size: int = 544
     model_input_size: int = 544
     crop_margin: int = 16
@@ -557,11 +559,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--senaryo", default=None, choices=["normal", "irtifa"],
                         help="Simülasyon senaryosu")
     parser.add_argument("--referans", default=None, metavar="YOL",
-                        help="Referans harita dosyası")
+                        help="Referans harita dosyasi veya haritalar klasoru")
     parser.add_argument("--gozlem", default=None, metavar="YOL",
                         help="Gözlem harita dosyası")
     parser.add_argument("--model", default=None, metavar="YOL",
-                        help="Model .h5 dosyası")
+                        help="Model dosyasi veya model klasoru")
     parser.add_argument("--adim-px", type=int, default=None, metavar="N",
                         help="Hareket adım büyüklüğü (piksel)")
     parser.add_argument("--arama-penceresi", type=int, default=None, metavar="N",
@@ -682,6 +684,121 @@ def load_observation_aligned_to_reference_grid(
             dst_nodata=0.0,
         )
     return np.clip(aligned, 0.0, 255.0).astype(np.uint8)
+
+
+def is_supported_map_file(path: Path) -> bool:
+    return path.is_file() and path.suffix.lower() in MAP_FILE_SUFFIXES
+
+
+def find_map_in_directory(map_dir: Path) -> Path:
+    if not map_dir.exists():
+        raise FileNotFoundError(
+            "Harita klasoru bulunamadi: %s. Harita dosyasini bu klasore koyun "
+            "veya --referans ile dosya/klasor verin." % map_dir
+        )
+    if not map_dir.is_dir():
+        raise ValueError("Harita yolu klasor degil: %s" % map_dir)
+
+    candidates = [
+        path
+        for path in map_dir.iterdir()
+        if is_supported_map_file(path)
+    ]
+    if not candidates:
+        raise FileNotFoundError(
+            "Harita klasorunde desteklenen harita dosyasi bulunamadi: %s "
+            "(desteklenen uzantilar: %s)"
+            % (map_dir, ", ".join(MAP_FILE_SUFFIXES))
+        )
+
+    candidates.sort(
+        key=lambda path: (path.stat().st_mtime, path.name.lower()),
+        reverse=True,
+    )
+    return candidates[0]
+
+
+def resolve_map_path(map_path: Path) -> Path:
+    if map_path.is_dir():
+        return find_map_in_directory(map_path)
+    if map_path.exists():
+        if is_supported_map_file(map_path):
+            return map_path
+        raise ValueError(
+            "Desteklenmeyen harita dosyasi: %s (desteklenen uzantilar: %s)"
+            % (map_path, ", ".join(MAP_FILE_SUFFIXES))
+        )
+    raise FileNotFoundError(
+        "Harita yolu bulunamadi: %s. Harita dosyasini '%s' klasorune koyun "
+        "veya --referans ile dosya/klasor verin." % (map_path, MAP_DIRECTORY)
+    )
+
+
+def is_supported_model_file(path: Path) -> bool:
+    return path.is_file() and path.suffix.lower() in MODEL_FILE_SUFFIXES
+
+
+def find_model_in_directory(model_dir: Path) -> Path:
+    if not model_dir.exists():
+        raise FileNotFoundError(
+            "Model klasoru bulunamadi: %s. Model dosyasini bu klasore koyun "
+            "veya --model ile dosya/klasor verin." % model_dir
+        )
+    if not model_dir.is_dir():
+        raise ValueError("Model yolu klasor degil: %s" % model_dir)
+
+    candidates = [
+        path
+        for path in model_dir.iterdir()
+        if is_supported_model_file(path)
+    ]
+    if not candidates:
+        raise FileNotFoundError(
+            "Model klasorunde desteklenen model dosyasi bulunamadi: %s "
+            "(desteklenen uzantilar: %s)"
+            % (model_dir, ", ".join(MODEL_FILE_SUFFIXES))
+        )
+
+    candidates.sort(
+        key=lambda path: (path.stat().st_mtime, path.name.lower()),
+        reverse=True,
+    )
+    return candidates[0]
+
+
+def resolve_model_path(model_path: Path) -> Path:
+    if model_path.is_dir():
+        return find_model_in_directory(model_path)
+    if model_path.exists():
+        if is_supported_model_file(model_path):
+            return model_path
+        raise ValueError(
+            "Desteklenmeyen model dosyasi: %s (desteklenen uzantilar: %s)"
+            % (model_path, ", ".join(MODEL_FILE_SUFFIXES))
+        )
+    raise FileNotFoundError(
+        "Model yolu bulunamadi: %s. Model dosyasini '%s' klasorune koyun "
+        "veya --model ile dosya/klasor verin." % (model_path, MODEL_DIRECTORY)
+    )
+
+
+def resolve_config_model_path(config: SimulationConfig) -> SimulationConfig:
+    resolved_model_path = resolve_model_path(config.model_path)
+    if resolved_model_path != config.model_path:
+        print("Model secildi: %s" % resolved_model_path)
+        return dataclasses.replace(config, model_path=resolved_model_path)
+    return config
+
+
+def resolve_config_paths(config: SimulationConfig) -> SimulationConfig:
+    resolved_reference_map_path = resolve_map_path(config.reference_map_path)
+    if resolved_reference_map_path != config.reference_map_path:
+        print("Harita secildi: %s" % resolved_reference_map_path)
+        config = dataclasses.replace(
+            config,
+            reference_map_path=resolved_reference_map_path,
+        )
+    return resolve_config_model_path(config)
 
 
 def load_model_compat(model_path: Path):
@@ -1498,19 +1615,20 @@ def apply_runtime_ui_hotkey(key: int, ui_state: dict) -> bool:
 
 def load_assets(config: SimulationConfig) -> Tuple[np.ndarray, np.ndarray, object]:
     validate_config(config)
-    if is_georaster_path(config.reference_map_path):
-        reference_map = load_grayscale_raster(config.reference_map_path)
+    reference_map_path = resolve_map_path(config.reference_map_path)
+    if is_georaster_path(reference_map_path):
+        reference_map = load_grayscale_raster(reference_map_path)
     else:
-        reference_map = load_grayscale_image(config.reference_map_path)
+        reference_map = load_grayscale_image(reference_map_path)
 
     if (
         config.align_observation_to_reference_grid
-        and is_georaster_path(config.reference_map_path)
+        and is_georaster_path(reference_map_path)
         and is_georaster_path(config.observation_map_path)
     ):
         observation_map = load_observation_aligned_to_reference_grid(
             config.observation_map_path,
-            config.reference_map_path,
+            reference_map_path,
         )
     elif is_georaster_path(config.observation_map_path):
         observation_map = load_grayscale_raster(config.observation_map_path)
@@ -1524,7 +1642,7 @@ def load_assets(config: SimulationConfig) -> Tuple[np.ndarray, np.ndarray, objec
             interpolation=cv2.INTER_LINEAR,
         )
 
-    model = load_model_compat(config.model_path)
+    model = load_model_compat(resolve_model_path(config.model_path))
     return reference_map, observation_map, model
 
 
@@ -3744,6 +3862,7 @@ def main(
     if config is None:
         config = SimulationConfig()
         config = _apply_args_to_config(config, _parse_args())
+    config = resolve_config_paths(config)
     reference_map, observation_map, model = load_assets(config)
     terrain_context: Optional[TerrainContext] = None
 
@@ -4272,6 +4391,7 @@ def main_qt(config=None) -> None:
     if config is None:
         config = SimulationConfig()
         config = _apply_args_to_config(config, _parse_args())
+    config = resolve_config_paths(config)
     win = SimulationWindow(config=config)
     win.show()
     _sys.exit(app.exec_())
