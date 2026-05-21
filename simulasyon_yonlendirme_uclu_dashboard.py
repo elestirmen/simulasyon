@@ -146,6 +146,7 @@ KALMAN_TOGGLE_KEYS = (ord("k"), ord("K"))
 NORM_CYCLE_KEYS = (ord("n"), ord("N"))
 OBS_WINDOW_CYCLE_KEYS = (ord("v"), ord("V"))
 REF_PATCH_TOGGLE_KEYS = (ord("m"), ord("M"))
+TRANSLATION_ACTIONS = ("forward", "backward", "strafe_left", "strafe_right")
 
 _NORM_MODES = ("HAM", "CLAHE", "HISTEQ", "EDGE")
 _OBS_WINDOW_SMALL = 272
@@ -318,7 +319,12 @@ class SimulationConfig:
     log_csv_enabled: bool = True
     log_csv_path: Optional[Path] = None
     # --- Otonom mod ---
+    autonomous_mode_enabled: bool = False
     autonomous_step_interval_ms: int = 400
+    autonomous_min_step_size_px: float = 40.0
+    autonomous_low_confidence_recovery_steps: int = 4
+    autonomous_stuck_max_steps: int = 4
+    autonomous_stuck_distance_epsilon_px: float = 20.0
     waypoint_acceptance_radius_px: float = 150.0
     waypoint_rotation_tolerance_deg: float = 15.0
     waypoint_body_axis_deadband_px: float = 50.0
@@ -917,6 +923,27 @@ def get_action_label(action: str) -> str:
         "altitude_down": "irtifa-",
     }
     return action_labels.get(action, "bekle")
+
+
+def is_translation_action(action: str) -> bool:
+    return action in TRANSLATION_ACTIONS
+
+
+def get_autonomous_step_size(
+    waypoint_distance_px: Optional[float],
+    config: SimulationConfig,
+) -> float:
+    max_step = max(1.0, float(config.step_size))
+    if waypoint_distance_px is None:
+        return max_step
+
+    acceptance_radius = max(1.0, float(config.waypoint_acceptance_radius_px))
+    if waypoint_distance_px <= acceptance_radius:
+        return 0.0
+
+    min_step = max(1.0, min(max_step, float(config.autonomous_min_step_size_px)))
+    approach_step = float(waypoint_distance_px) - (acceptance_radius * 0.65)
+    return max(min_step, min(max_step, approach_step))
 
 
 def get_triplet_rotation_margin(config: SimulationConfig) -> int:
@@ -1554,7 +1581,7 @@ def create_runtime_ui_state(config: SimulationConfig) -> dict:
         "tm_boxes": bool(config.show_tm_boxes),
         "heading_arrow": bool(config.show_heading_arrow),
         "observation_boxes": bool(config.show_observation_boxes),
-        "autonomous_mode": False,
+        "autonomous_mode": bool(config.autonomous_mode_enabled),
         "kalman_on": bool(config.kalman_enabled),
         "norm_mode": "HISTEQ",
         "obs_window_size": config.sample_window_size,
@@ -3647,18 +3674,20 @@ def move_observation_cursor(
     image_shape: Tuple[int, int],
     heading_degrees: float,
     config: SimulationConfig,
+    step_size_px: Optional[float] = None,
 ) -> Tuple[int, int]:
     move_x = 0.0
     move_y = 0.0
+    action_step_size = float(config.step_size if step_size_px is None else step_size_px)
 
     if action == "forward":
-        move_x, move_y = rotate_image_offset(0.0, -float(config.step_size), heading_degrees)
+        move_x, move_y = rotate_image_offset(0.0, -action_step_size, heading_degrees)
     elif action == "backward":
-        move_x, move_y = rotate_image_offset(0.0, float(config.step_size), heading_degrees)
+        move_x, move_y = rotate_image_offset(0.0, action_step_size, heading_degrees)
     elif action == "strafe_right":
-        move_x, move_y = rotate_image_offset(float(config.step_size), 0.0, heading_degrees)
+        move_x, move_y = rotate_image_offset(action_step_size, 0.0, heading_degrees)
     elif action == "strafe_left":
-        move_x, move_y = rotate_image_offset(-float(config.step_size), 0.0, heading_degrees)
+        move_x, move_y = rotate_image_offset(-action_step_size, 0.0, heading_degrees)
 
     row += int(round(move_y))
     col += int(round(move_x))
@@ -3674,6 +3703,7 @@ def apply_control_action(
     action: str,
     image_shape: Tuple[int, int],
     config: SimulationConfig,
+    step_size_px: Optional[float] = None,
 ) -> Tuple[int, int, float, float]:
     if action == "rotate_left":
         return (
@@ -3715,6 +3745,7 @@ def apply_control_action(
         image_shape,
         heading_degrees,
         config,
+        step_size_px,
     )
     return row, col, heading_degrees, altitude_agl_m
 
@@ -3884,12 +3915,19 @@ def main(
         actual_history: List[Tuple[int, int]] = []
         step_count = 0
         last_action = ""
+        last_action_step_size = 0.0
         heading_degrees = normalize_heading_degrees(config.initial_heading_degrees)
         altitude_agl_m = clamp_altitude_agl(config.initial_altitude_agl_m, config)
         previous_predicted_center: Optional[Tuple[int, int]] = None
         search_window_size = config.base_search_window_size
         kalman: Optional[PositionKalmanFilter] = None
         low_confidence_steps = 0
+        waypoint_hits = 0
+        active_waypoint_target: Optional[Tuple[int, int]] = None
+        previous_waypoint_distance_px: Optional[float] = None
+        auto_no_progress_steps = 0
+        auto_last_action = ""
+        auto_same_action_steps = 0
 
         runtime_ui_state = create_runtime_ui_state(config)
         runtime_ui_buttons = _build_runtime_buttons() if config.ui_buttons_enabled else []
@@ -3992,7 +4030,7 @@ def main(
                             init_pos, config.kalman_process_noise, config.kalman_measurement_noise,
                         )
                     moved = propagate_center_with_action(
-                        (0, 0), last_action, heading_degrees, float(config.step_size),
+                        (0, 0), last_action, heading_degrees, last_action_step_size,
                     )
                     kalman.predict(
                         float(moved[0]) if moved is not None else 0.0,
@@ -4047,7 +4085,40 @@ def main(
                     if kalman_center is not None else None
                 )
 
+                autonomous_mode = bool(runtime_ui_state.get("autonomous_mode", False))
                 waypoint_target: Optional[Tuple[int, int]] = runtime_ui_context.get("waypoint_target")
+                if waypoint_target != active_waypoint_target:
+                    active_waypoint_target = waypoint_target
+                    waypoint_hits = 0
+                    previous_waypoint_distance_px = None
+                    auto_no_progress_steps = 0
+                    auto_last_action = ""
+                    auto_same_action_steps = 0
+                if autonomous_mode and waypoint_target is not None:
+                    waypoint_index, waypoint_hits = update_waypoint_progress(
+                        0,
+                        waypoint_hits,
+                        display_predicted_center,
+                        (waypoint_target,),
+                        config.waypoint_acceptance_radius_px,
+                        quality.confidence,
+                        config.waypoint_acceptance_confidence_threshold,
+                        config.waypoint_required_consecutive_hits,
+                    )
+                    if waypoint_index >= 1:
+                        runtime_ui_context["waypoint_target"] = None
+                        runtime_ui_state["autonomous_mode"] = False
+                        runtime_ui_state["_dirty"] = True
+                        active_waypoint_target = None
+                        waypoint_target = None
+                        waypoint_hits = 0
+                        previous_waypoint_distance_px = None
+                        auto_no_progress_steps = 0
+                        auto_last_action = ""
+                        auto_same_action_steps = 0
+                        last_action = "hold"
+                        last_action_step_size = 0.0
+                        autonomous_mode = False
                 waypoint_distance_px: Optional[float] = (
                     math.hypot(
                         display_predicted_center[0] - waypoint_target[0],
@@ -4055,7 +4126,6 @@ def main(
                     )
                     if waypoint_target is not None else None
                 )
-                autonomous_mode = bool(runtime_ui_state.get("autonomous_mode", False))
 
                 predicted_history.append(display_predicted_center)
                 actual_history.append(actual_center)
@@ -4169,8 +4239,23 @@ def main(
 
                     if runtime_ui_state.get("_dirty"):
                         # waypoint veya toggle değişmiş olabilir
-                        _dash_kw["waypoint_target"] = runtime_ui_context.get("waypoint_target")
+                        dirty_waypoint_target = runtime_ui_context.get("waypoint_target")
+                        if dirty_waypoint_target != active_waypoint_target:
+                            active_waypoint_target = dirty_waypoint_target
+                            waypoint_hits = 0
+                            previous_waypoint_distance_px = None
+                            auto_no_progress_steps = 0
+                            auto_last_action = ""
+                            auto_same_action_steps = 0
+                        _dash_kw["waypoint_target"] = dirty_waypoint_target
                         _dash_kw["autonomous_mode"] = bool(runtime_ui_state.get("autonomous_mode", False))
+                        _dash_kw["waypoint_distance_px"] = (
+                            math.hypot(
+                                display_predicted_center[0] - dirty_waypoint_target[0],
+                                display_predicted_center[1] - dirty_waypoint_target[1],
+                            )
+                            if dirty_waypoint_target is not None else None
+                        )
                         dashboard = draw_localization_dashboard(**_dash_kw)
                         continue
 
@@ -4187,26 +4272,81 @@ def main(
                         dashboard = draw_localization_dashboard(**_dash_kw)
                         # Kalman veya ref-patch toggle → layout değişir, hemen sonraki adıma geç
                         if key in KALMAN_TOGGLE_KEYS or key in REF_PATCH_TOGGLE_KEYS:
+                            last_action = "hold"
+                            last_action_step_size = 0.0
                             step_count += 1
                             break
                         continue
 
                     if bool(runtime_ui_state.get("autonomous_mode", False)):
+                        auto_waypoint_target = runtime_ui_context.get("waypoint_target")
+                        if auto_waypoint_target is None:
+                            last_action = "hold"
+                            last_action_step_size = 0.0
+                            continue
+                        current_waypoint_distance_px = math.hypot(
+                            display_predicted_center[0] - auto_waypoint_target[0],
+                            display_predicted_center[1] - auto_waypoint_target[1],
+                        )
+                        action_low_confidence_steps = (
+                            low_confidence_steps
+                            if low_confidence_steps <= config.autonomous_low_confidence_recovery_steps
+                            else 1
+                        )
                         auto_action = choose_autonomous_action(
                             display_predicted_center,
-                            runtime_ui_context.get("waypoint_target"),
+                            auto_waypoint_target,
                             heading_degrees,
-                            low_confidence_steps,
+                            action_low_confidence_steps,
                             config.waypoint_acceptance_radius_px,
                             config.waypoint_rotation_tolerance_deg,
                             config.waypoint_body_axis_deadband_px,
                         )
+                        if previous_waypoint_distance_px is not None:
+                            if current_waypoint_distance_px >= (
+                                previous_waypoint_distance_px
+                                - config.autonomous_stuck_distance_epsilon_px
+                            ):
+                                auto_no_progress_steps += 1
+                            else:
+                                auto_no_progress_steps = 0
+                        previous_waypoint_distance_px = current_waypoint_distance_px
+
+                        if auto_action == auto_last_action:
+                            auto_same_action_steps += 1
+                        else:
+                            auto_last_action = auto_action
+                            auto_same_action_steps = 1
+
+                        if (
+                            auto_no_progress_steps >= config.autonomous_stuck_max_steps
+                            and is_translation_action(auto_action)
+                            and auto_same_action_steps >= config.autonomous_stuck_max_steps
+                        ):
+                            auto_action = (
+                                "rotate_right"
+                                if (step_count % 2 == 0)
+                                else "rotate_left"
+                            )
+                            auto_no_progress_steps = 0
+                            auto_last_action = auto_action
+                            auto_same_action_steps = 1
+
+                        last_action = auto_action or "hold"
                         if auto_action not in ("hold", ""):
+                            auto_step_size = (
+                                get_autonomous_step_size(current_waypoint_distance_px, config)
+                                if is_translation_action(auto_action)
+                                else 0.0
+                            )
                             row, col, heading_degrees, altitude_agl_m = apply_control_action(
                                 row, col, heading_degrees, altitude_agl_m,
                                 auto_action, observation_map.shape, config,
+                                step_size_px=auto_step_size,
                             )
-                            last_action = auto_action
+                            last_action_step_size = auto_step_size
+                        else:
+                            last_action_step_size = 0.0
                         step_count += 1
                         break
 
@@ -4221,6 +4361,7 @@ def main(
                             action, observation_map.shape, config,
                         )
                         last_action = action
+                        last_action_step_size = float(config.step_size) if is_translation_action(action) else 0.0
                         step_count += 1
                         break
 

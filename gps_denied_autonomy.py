@@ -284,12 +284,12 @@ def choose_autonomous_action(
     if estimated_center is None:
         return "rotate_right" if (low_confidence_steps % 2) else "rotate_left"
 
+    if low_confidence_steps >= 2:
+        return "rotate_right" if (low_confidence_steps % 2) else "rotate_left"
+
     distance_px = distance_between_points(estimated_center, target_center)
     if distance_px <= float(waypoint_acceptance_radius_px):
         return "hold"
-
-    if low_confidence_steps >= 2:
-        return "rotate_right" if (low_confidence_steps % 2) else "rotate_left"
 
     desired_heading = heading_to_target(estimated_center, target_center)
     heading_error = shortest_heading_error_degrees(heading_degrees, desired_heading)
