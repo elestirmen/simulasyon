@@ -1517,6 +1517,196 @@ def _draw_runtime_buttons(
         current_y += button_height + gap
 
 
+# ---------------------------------------------------------------------------
+# Sütun genişliği — sürüklenebilir ayraçlar + kalıcı düzen (ui_layout.json)
+# ---------------------------------------------------------------------------
+_UI_LAYOUT_PATH = Path("ui_layout.json")
+_MIN_MAP_WIDTH_PX = 220
+
+
+def _compute_panel_widths(
+    config: "SimulationConfig",
+    ui_state: Optional[dict] = None,
+) -> Tuple[int, int]:
+    """Sol ve sağ sütun genişliklerini (piksel) sınırlandırarak hesaplar.
+
+    ui_state verilirse kullanıcının sürüklediği değerler kullanılır; aksi halde
+    config varsayılanları geçerlidir. Orta (harita) sütununun daima en az
+    _MIN_MAP_WIDTH_PX kalması garanti edilir.
+    """
+    dashboard_width = int(config.display_size[0])
+    fixed = (4 * config.panel_padding) + (2 * config.panel_gap)
+    available = dashboard_width - fixed
+
+    if ui_state is not None:
+        left_ratio = float(ui_state.get("left_panel_ratio", config.left_panel_width_ratio))
+        right_width = int(ui_state.get("right_panel_width", config.right_info_panel_width))
+    else:
+        left_ratio = float(config.left_panel_width_ratio)
+        right_width = int(config.right_info_panel_width)
+
+    left_width = int(round(dashboard_width * left_ratio))
+
+    min_left = max(120, int(dashboard_width * 0.12))
+    max_left = int(dashboard_width * 0.42)
+    min_right = 130
+    max_right = int(dashboard_width * 0.34)
+
+    left_width = max(min_left, min(max_left, left_width))
+    right_width = max(min_right, min(max_right, right_width))
+
+    # Harita sütunu minimumun altına düşerse önce sağ, sonra sol sütunu kıs.
+    overflow = _MIN_MAP_WIDTH_PX - (available - left_width - right_width)
+    if overflow > 0:
+        shrink_right = min(overflow, right_width - min_right)
+        right_width -= shrink_right
+        overflow -= shrink_right
+        if overflow > 0:
+            left_width = max(min_left, left_width - overflow)
+    return left_width, right_width
+
+
+def _clamp_dragged_panel_width(
+    which: str,
+    proposed: float,
+    fixed_other_width: int,
+    config: "SimulationConfig",
+) -> int:
+    """Sürüklenen sütun genişliğini, diğer sütun sabit kabul edilerek sınırlar."""
+    dashboard_width = int(config.display_size[0])
+    fixed = (4 * config.panel_padding) + (2 * config.panel_gap)
+    available = dashboard_width - fixed
+    if which == "left":
+        lo = max(120, int(dashboard_width * 0.12))
+        hi = int(dashboard_width * 0.42)
+    else:
+        lo = 130
+        hi = int(dashboard_width * 0.34)
+    hi = min(hi, available - fixed_other_width - _MIN_MAP_WIDTH_PX)
+    lo = min(lo, hi)
+    return int(max(lo, min(hi, proposed)))
+
+
+def _get_splitter_zones(
+    config: "SimulationConfig",
+    ui_state: Optional[dict],
+) -> dict:
+    """Sol/sağ ayraç çubuklarının merkez-x ve dikey aralığını döndürür."""
+    left_width, right_width = _compute_panel_widths(config, ui_state)
+    pad = config.panel_padding
+    gap = config.panel_gap
+    dashboard_width, dashboard_height = config.display_size
+    map_x = pad + left_width + gap
+    map_width = dashboard_width - (4 * pad) - (2 * gap) - left_width - right_width
+    return {
+        "left": (pad + left_width + (gap // 2), pad, dashboard_height - pad),
+        "right": (map_x + map_width + (gap // 2), pad, dashboard_height - pad),
+    }
+
+
+def _hit_test_splitter(
+    x: int,
+    y: int,
+    config: "SimulationConfig",
+    ui_state: Optional[dict],
+) -> Optional[str]:
+    """(x, y) bir ayraç çubuğu üzerindeyse adını ('left'/'right') döndürür."""
+    grab = max(8, (config.panel_gap // 2) + 4)
+    for name, (center_x, y0, y1) in _get_splitter_zones(config, ui_state).items():
+        if abs(x - center_x) <= grab and y0 <= y <= y1:
+            return name
+    return None
+
+
+def _apply_splitter_drag(
+    ui_state: dict,
+    config: "SimulationConfig",
+    x: int,
+) -> None:
+    """Sürüklenen ayraca göre sol/sağ sütun genişliğini günceller."""
+    which = ui_state.get("_dragging_splitter")
+    if which is None:
+        return
+    pad = config.panel_padding
+    gap = config.panel_gap
+    dashboard_width = int(config.display_size[0])
+    left_width, right_width = _compute_panel_widths(config, ui_state)
+    if which == "left":
+        # Ayraç merkezi = pad + left_width + gap/2
+        proposed = x - pad - (gap / 2.0)
+        new_left = _clamp_dragged_panel_width("left", proposed, right_width, config)
+        ui_state["left_panel_ratio"] = new_left / float(dashboard_width)
+    else:
+        # Ayraç merkezi = dashboard_width - pad - right_width - gap/2
+        proposed = dashboard_width - pad - (gap / 2.0) - x
+        new_right = _clamp_dragged_panel_width("right", proposed, left_width, config)
+        ui_state["right_panel_width"] = int(new_right)
+    ui_state["_dirty"] = True
+    ui_state["_layout_dirty"] = True
+
+
+def load_ui_layout_overrides(config: "SimulationConfig") -> Tuple[float, int]:
+    """ui_layout.json varsa kayıtlı sütun düzenini, yoksa config varsayılanını verir."""
+    left_ratio = float(config.left_panel_width_ratio)
+    right_width = int(config.right_info_panel_width)
+    try:
+        if _UI_LAYOUT_PATH.exists():
+            data = json.loads(_UI_LAYOUT_PATH.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                left_ratio = float(data.get("left_panel_ratio", left_ratio))
+                right_width = int(data.get("right_panel_width", right_width))
+    except (OSError, ValueError, TypeError):
+        pass
+    left_width, right_width = _compute_panel_widths(
+        config,
+        {"left_panel_ratio": left_ratio, "right_panel_width": right_width},
+    )
+    return left_width / float(config.display_size[0]), right_width
+
+
+def save_ui_layout(ui_state: dict) -> None:
+    """Geçerli sütun düzenini ui_layout.json dosyasına yazar."""
+    try:
+        _UI_LAYOUT_PATH.write_text(
+            json.dumps(
+                {
+                    "left_panel_ratio": round(float(ui_state.get("left_panel_ratio", 0.20)), 5),
+                    "right_panel_width": int(ui_state.get("right_panel_width", 180)),
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+    except (OSError, TypeError, ValueError):
+        pass
+
+
+def _draw_splitter_handles(
+    canvas: np.ndarray,
+    config: "SimulationConfig",
+    ui_state: dict,
+) -> None:
+    """Sürüklenebilir sütun ayraçlarını tutamak göstergesiyle çizer."""
+    dragging = ui_state.get("_dragging_splitter")
+    hover = ui_state.get("_splitter_hover")
+    for name, (center_x, y0, y1) in _get_splitter_zones(config, ui_state).items():
+        is_active = name == dragging
+        is_hot = is_active or name == hover
+        half_width = 5 if is_hot else 3
+        bar_color = UI_COLORS["accent"] if is_hot else UI_COLORS["panel_border"]
+        alpha = 0.95 if is_active else (0.75 if is_hot else 0.40)
+        _draw_alpha_rounded_panel(
+            canvas,
+            center_x - half_width, y0,
+            center_x + half_width, y1,
+            half_width, bar_color, alpha,
+        )
+        grip_color = UI_COLORS["text_primary"] if is_hot else (175, 180, 190)
+        mid_y = (y0 + y1) // 2
+        for offset in (-16, -8, 0, 8, 16):
+            cv2.circle(canvas, (center_x, mid_y + offset), 2, grip_color, -1, cv2.LINE_AA)
+
+
 def _runtime_buttons_mouse_cb(event: int, x: int, y: int, flags: int, userdata: dict) -> None:
     _ = flags
     if not isinstance(userdata, dict):
@@ -1529,18 +1719,41 @@ def _runtime_buttons_mouse_cb(event: int, x: int, y: int, flags: int, userdata: 
         y = int((y - int(_lb.get("y_off", 0))) / _scale)
     ui_state = userdata.get("state")
     buttons = userdata.get("buttons")
+    config = userdata.get("config")
     if not isinstance(ui_state, dict) or not isinstance(buttons, list):
+        return
+
+    # --- Sütun ayracı sürükleme: bırakma olayı ---
+    if event == cv2.EVENT_LBUTTONUP:
+        if ui_state.get("_dragging_splitter") is not None:
+            ui_state["_dragging_splitter"] = None
+            save_ui_layout(ui_state)
+            ui_state["_dirty"] = True
+        return
+
+    # --- Sütun ayracı sürükleme: sürüş sürüyor ---
+    if ui_state.get("_dragging_splitter") is not None and config is not None:
+        if event == cv2.EVENT_MOUSEMOVE:
+            _apply_splitter_drag(ui_state, config, x)
         return
 
     if event == cv2.EVENT_MOUSEMOVE:
         previous_hover = ui_state.get("_hover_key")
+        previous_split = ui_state.get("_splitter_hover")
         ui_state["_hover_key"] = None
         for button in buttons:
             bx, by, bw, bh = button.get("rect", (0, 0, 0, 0))
             if bx <= x <= (bx + bw) and by <= y <= (by + bh):
                 ui_state["_hover_key"] = button.get("key")
                 break
-        if previous_hover != ui_state.get("_hover_key"):
+        split_hover = None
+        if config is not None and ui_state.get("_hover_key") is None:
+            split_hover = _hit_test_splitter(x, y, config, ui_state)
+        ui_state["_splitter_hover"] = split_hover
+        if (
+            previous_hover != ui_state.get("_hover_key")
+            or previous_split != split_hover
+        ):
             ui_state["_dirty"] = True
         return
 
@@ -1554,6 +1767,15 @@ def _runtime_buttons_mouse_cb(event: int, x: int, y: int, flags: int, userdata: 
             key = button.get("key")
             ui_state[key] = not bool(ui_state.get(key, False))
             ui_state["_dirty"] = True
+            return
+
+    # Sütun ayracına basıldıysa sürüklemeyi başlat
+    if config is not None:
+        hit_splitter = _hit_test_splitter(x, y, config, ui_state)
+        if hit_splitter is not None:
+            ui_state["_dragging_splitter"] = hit_splitter
+            ui_state["_splitter_hover"] = hit_splitter
+            _apply_splitter_drag(ui_state, config, x)
             return
 
     # Otonom modda harita paneline tıklama → waypoint ayarla
@@ -1574,6 +1796,7 @@ def _runtime_buttons_mouse_cb(event: int, x: int, y: int, flags: int, userdata: 
 
 
 def create_runtime_ui_state(config: SimulationConfig) -> dict:
+    left_panel_ratio, right_panel_width = load_ui_layout_overrides(config)
     return {
         "info_panel": bool(config.show_info_panel),
         "trajectory": bool(config.show_trajectory),
@@ -1588,8 +1811,13 @@ def create_runtime_ui_state(config: SimulationConfig) -> dict:
         "obs_window_default": config.sample_window_size,
         "obs_272_mode": False,
         "ref_patch": False,
+        "left_panel_ratio": left_panel_ratio,
+        "right_panel_width": right_panel_width,
         "_panel_collapsed": True,
         "_hover_key": None,
+        "_splitter_hover": None,
+        "_dragging_splitter": None,
+        "_layout_dirty": False,
         "_dirty": True,
         "_quality": None,
     }
@@ -2296,6 +2524,7 @@ def resize_to_fit(image: np.ndarray, target_width: int, target_height: int) -> n
 def get_dashboard_layout(
     config: SimulationConfig,
     show_ref_patch: bool = False,
+    ui_state: Optional[dict] = None,
 ) -> Tuple[
     Tuple[int, int, int, int],
     Tuple[int, int, int, int],
@@ -2304,8 +2533,7 @@ def get_dashboard_layout(
     Tuple[int, int, int, int],
 ]:
     dashboard_width, dashboard_height = config.display_size
-    left_panel_width = int(dashboard_width * float(config.left_panel_width_ratio))
-    right_panel_width = int(config.right_info_panel_width)
+    left_panel_width, right_panel_width = _compute_panel_widths(config, ui_state)
     # Harita: sol kolon + sağ telemetri kolonunu çıkar
     # Kenar boşluğu yapısı: pad | sol | gap | harita | gap | sağ | pad
     map_width = (
@@ -2647,6 +2875,167 @@ def draw_heading_arrow(
     )
 
 
+# ---------------------------------------------------------------------------
+# Uçak simgesi (yöne göre dönen araç göstergesi)
+# ---------------------------------------------------------------------------
+# Tüm noktalar normalize edilmiş gövde çerçevesinde tanımlıdır:
+#   - dönüş merkezi (0, 0)
+#   - burun (0, -1), kuyruk (0, +1)
+#   - +x sağ kanat yönü
+# Çizimden önce her nokta başlık açısı kadar döndürülür.
+_AIRCRAFT_OUTLINE = (
+    (0.000, -1.000),   # burun
+    (0.071, -0.786),
+    (0.083, -0.048),   # ön gövde / kanat kökü öncesi
+    (0.119,  0.048),   # sağ kanat hücum kenarı kökü
+    (0.929,  0.452),   # sağ kanat ucu (hücum)
+    (0.952,  0.548),   # sağ kanat ucu (firar)
+    (0.143,  0.381),   # sağ kanat firar kenarı kökü
+    (0.095,  0.667),   # arka gövde
+    (0.405,  0.857),   # sağ yatay dengeleyici ucu (hücum)
+    (0.405,  0.929),   # sağ yatay dengeleyici ucu (firar)
+    (0.060,  0.881),   # dengeleyici kökü
+    (0.060,  1.000),   # kuyruk (sağ)
+    (-0.060, 1.000),   # kuyruk (sol)
+    (-0.060, 0.881),
+    (-0.405, 0.929),
+    (-0.405, 0.857),
+    (-0.095, 0.667),
+    (-0.143, 0.381),
+    (-0.952, 0.548),
+    (-0.929, 0.452),
+    (-0.119, 0.048),
+    (-0.083, -0.048),
+    (-0.071, -0.786),
+)
+
+_AIRCRAFT_FUSELAGE = (
+    (0.000, -1.000),
+    (0.072, -0.700),
+    (0.090,  0.100),
+    (0.072,  0.620),
+    (0.045,  0.930),
+    (-0.045, 0.930),
+    (-0.072, 0.620),
+    (-0.090, 0.100),
+    (-0.072, -0.700),
+)
+
+_AIRCRAFT_TAILFIN = (
+    (0.000, 0.500),
+    (0.050, 0.930),
+    (-0.050, 0.930),
+)
+
+_AIRCRAFT_COCKPIT = (
+    (0.000, -0.860),
+    (0.050, -0.700),
+    (0.000, -0.520),
+    (-0.050, -0.700),
+)
+
+
+def _scale_color(
+    color: Tuple[int, int, int],
+    factor: float,
+) -> Tuple[int, int, int]:
+    """factor < 1 rengi karartır, factor > 1 beyaza doğru açar."""
+    if factor <= 1.0:
+        return tuple(int(max(0, min(255, round(channel * factor)))) for channel in color)
+    blend = min(1.0, factor - 1.0)
+    return tuple(
+        int(max(0, min(255, round(channel + (255 - channel) * blend))))
+        for channel in color
+    )
+
+
+def _blend_filled_poly(
+    image: np.ndarray,
+    points: np.ndarray,
+    color: Tuple[int, int, int],
+    alpha: float,
+) -> None:
+    """Dolu poligonu sınırlayıcı kutu içinde saydam olarak harmanlar."""
+    x, y, width, height = cv2.boundingRect(points)
+    pad = 2
+    x0 = max(0, x - pad)
+    y0 = max(0, y - pad)
+    x1 = min(image.shape[1], x + width + pad)
+    y1 = min(image.shape[0], y + height + pad)
+    if x1 <= x0 or y1 <= y0:
+        return
+    roi = image[y0:y1, x0:x1]
+    overlay = roi.copy()
+    local_points = points - np.array((x0, y0), dtype=np.int32)
+    cv2.fillPoly(overlay, [local_points], color, cv2.LINE_AA)
+    cv2.addWeighted(overlay, alpha, roi, 1.0 - alpha, 0, dst=roi)
+
+
+def draw_aircraft_marker(
+    image: np.ndarray,
+    origin: Tuple[int, int],
+    heading_degrees: float,
+    length: int,
+    color: Tuple[int, int, int],
+    thickness: int,
+) -> None:
+    """Aracı, başlık açısına göre dönen bir uçak silueti olarak çizer.
+
+    Burun her zaman uçuş yönünü gösterir; araç döndükçe simge de döner.
+    Uzaklaştırılmış (küçük) görünümlerde ayrıntılar kademeli olarak gizlenir.
+    """
+    if length <= 0:
+        return
+    radius = max(6.0, float(length) * 0.55)
+
+    def _project(points: tuple) -> np.ndarray:
+        projected = []
+        for local_x, local_y in points:
+            offset_x, offset_y = rotate_image_offset(
+                local_x * radius, local_y * radius, heading_degrees
+            )
+            projected.append(
+                (
+                    int(round(origin[0] + offset_x)),
+                    int(round(origin[1] + offset_y)),
+                )
+            )
+        return np.array(projected, dtype=np.int32)
+
+    outline_points = _project(_AIRCRAFT_OUTLINE)
+
+    # Derinlik hissi için sağ-alta kaydırılmış yumuşak gölge.
+    shadow_offset = max(2, int(round(radius * 0.10)))
+    _blend_filled_poly(
+        image,
+        outline_points + np.array((shadow_offset, shadow_offset), dtype=np.int32),
+        (8, 8, 12),
+        0.35,
+    )
+
+    wing_color = _scale_color(color, 0.78)
+    outline_color = _scale_color(color, 0.30)
+    line_width = max(1, min(3, int(round(radius / 46.0))))
+
+    # Kanatlar + kuyruk silueti (gövdeden biraz koyu).
+    cv2.fillPoly(image, [outline_points], wing_color, cv2.LINE_AA)
+    cv2.polylines(image, [outline_points], True, outline_color, line_width, cv2.LINE_AA)
+
+    # Gövde — kanatların üzerinde, ana renkte: katmanlı/3B görünüm verir.
+    if radius >= 18.0:
+        fuselage_points = _project(_AIRCRAFT_FUSELAGE)
+        cv2.fillPoly(image, [fuselage_points], color, cv2.LINE_AA)
+        cv2.polylines(
+            image, [fuselage_points], True, outline_color,
+            max(1, line_width - 1), cv2.LINE_AA,
+        )
+
+    # Dikey dengeleyici (kuyrukta koyu üçgen) + kokpit camı.
+    if radius >= 30.0:
+        cv2.fillPoly(image, [_project(_AIRCRAFT_TAILFIN)], _scale_color(color, 0.5), cv2.LINE_AA)
+        cv2.fillPoly(image, [_project(_AIRCRAFT_COCKPIT)], (28, 30, 38), cv2.LINE_AA)
+
+
 def create_observation_context_view(
     observation_map: np.ndarray,
     observation_boxes: List[Tuple[int, int, int, int]],
@@ -2724,7 +3113,7 @@ def create_observation_context_view(
     local_center = (actual_center[0] - left, actual_center[1] - top)
     cv2.circle(view, local_center, 6, config.actual_intersection_color, -1)
     if ui_state.get("heading_arrow", True):
-        draw_heading_arrow(
+        draw_aircraft_marker(
             view,
             local_center,
             heading_degrees,
@@ -3553,7 +3942,7 @@ def draw_localization_dashboard(
         overlay_thickness,
     )
     if ui_state.get("heading_arrow", True):
-        draw_heading_arrow(
+        draw_aircraft_marker(
             preview,
             scaled_actual_center,
             heading_degrees,
@@ -3661,6 +4050,8 @@ def draw_localization_dashboard(
         autonomous_mode=autonomous_mode,
         waypoint_distance_px=waypoint_distance_px,
     )
+    _draw_splitter_handles(canvas, config, ui_state)
+
     if config.ui_buttons_enabled:
         _draw_runtime_buttons(canvas, ui_state, runtime_ui_buttons, config)
 
@@ -3937,6 +4328,7 @@ def main(
             "buttons": runtime_ui_buttons,
             "reference_preview_state": None,
             "waypoint_target": None,
+            "config": config,
             "_lb": _lb_state,
         }
         if _ctx_holder is not None:
@@ -4138,10 +4530,10 @@ def main(
                     reference_map.shape, display_predicted_center, search_window_size,
                 )
 
-                # Ref-patch toggle'a göre layout yeniden hesapla
+                # Ref-patch toggle'a ve sütun genişliklerine göre layout yeniden hesapla
                 _show_ref_patch = bool(runtime_ui_state.get("ref_patch", False))
                 observation_rect, template_rect, map_rect, ref_patch_rect, right_panel_rect = get_dashboard_layout(
-                    config, _show_ref_patch,
+                    config, _show_ref_patch, runtime_ui_state,
                 )
                 # Haritada yeşil (O2) eşleşmesinin bulduğu bölgeyi her adımda çıkar
                 ref_patch_image: Optional[np.ndarray] = None
@@ -4238,6 +4630,29 @@ def main(
                     key = _getkey_fn(wait_ms) if _getkey_fn is not None else cv2.waitKeyEx(wait_ms)
 
                     if runtime_ui_state.get("_dirty"):
+                        # Sütun ayracı sürüklendiyse layout + harita önizlemesini yenile
+                        if runtime_ui_state.get("_layout_dirty"):
+                            runtime_ui_state["_layout_dirty"] = False
+                            (
+                                observation_rect,
+                                template_rect,
+                                map_rect,
+                                ref_patch_rect,
+                                right_panel_rect,
+                            ) = get_dashboard_layout(
+                                config,
+                                bool(runtime_ui_state.get("ref_patch", False)),
+                                runtime_ui_state,
+                            )
+                            reference_preview_state = create_reference_preview_state(
+                                reference_map, map_rect, reference_viewport_box, config,
+                            )
+                            runtime_ui_context["reference_preview_state"] = reference_preview_state
+                            _dash_kw["observation_rect"] = observation_rect
+                            _dash_kw["template_rect"] = template_rect
+                            _dash_kw["ref_patch_rect"] = ref_patch_rect
+                            _dash_kw["right_panel_rect"] = right_panel_rect
+                            _dash_kw["reference_preview_state"] = reference_preview_state
                         # waypoint veya toggle değişmiş olabilir
                         dirty_waypoint_target = runtime_ui_context.get("waypoint_target")
                         if dirty_waypoint_target != active_waypoint_target:
