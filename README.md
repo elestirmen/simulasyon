@@ -2,7 +2,7 @@
 
 Bu depo, İHA’nın **gözlem haritasından** üç komşu bölgeden alınan görüntüleri (üçlü şablon) bir **derin öğrenme modelinden** geçirip, çıktıları **referans haritada** OpenCV şablon eşleştirmesi ile arayarak konum tahmini sürecini simüle eder. Tahmin, üç eşleşme kutusunun kesişiminden veya geometrik tutarlılık modlarından türetilir; arama bölgesi (ROI) önceki tahmine göre uyarlanır veya tüm haritaya genişler.
 
-Ana uygulama `simulasyon_yonlendirme_uclu_dashboard.py`: sol tarafta gözlem ve model çıktıları, sağda referans harita önizlemesi ve HUD ile tek bir OpenCV penceresinde çalışır.
+Ana uygulama `simulasyon_yonlendirme_uclu_dashboard.py`: sol tarafta gözlem ve model çıktıları, sağda referans harita önizlemesi ve HUD ile tek bir pencerede çalışır. Varsayılan giriş noktası **PyQt5** penceresidir (`main_qt`); PyQt5 kurulu değilse otomatik olarak OpenCV penceresine (`main`) düşer.
 
 ---
 
@@ -11,7 +11,7 @@ Ana uygulama `simulasyon_yonlendirme_uclu_dashboard.py`: sol tarafta gözlem ve 
 | Dosya | Rol |
 |--------|-----|
 | `simulasyon_yonlendirme_uclu_dashboard.py` | Ana simülasyon, dashboard, şablon eşleştirme ve isteğe bağlı tanılama toplu çalıştırması |
-| `gps_denied_autonomy.py` | Görev senaryoları, kalite metrikleri ve otonom hareket seçimi için **bağımsız** yardımcı modül (şu an dashboard tarafından import edilmez; deneyler veya başka betikler için) |
+| `gps_denied_autonomy.py` | Lokalizasyon kalitesi, sensör füzyonu, waypoint ilerlemesi ve otonom hareket seçimi için yardımcı modül (dashboard tarafından **import edilir** ve aktif kullanılır) |
 | `simulasyon_yonlendirme_model_okuma.py` | Model okuma / ilgili deney akışı |
 | `simulasyon_yonlendirme.py`, `simulasyon_yonlendirme_uclu.py` | Daha eski veya sadeleştirilmiş yönlendirme denemeleri |
 | `simulasyon_otonom.py`, `simulasyon_konuma_otonom_gitme*.py`, `simulasyon_hizli.py` | Otonom veya hızlı varyant denemeleri |
@@ -28,11 +28,13 @@ Ana uygulama `simulasyon_yonlendirme_uclu_dashboard.py`: sol tarafta gözlem ve 
 - **Rasterio** — `.tif` / GeoTIFF okuma; gözlemi referans ızgarasına hizalama
 - **pyproj** — koordinat dönüşümleri (irtifa / DEM ile arazi örneklemesi)
 - **TensorFlow 2 + Keras** — `.h5` model yükleme; eski modeller için `Conv2DTranspose` uyumluluk sınıfı kullanılır
+- **PyQt5** *(isteğe bağlı)* — Varsayılan pencere arayüzü; kurulu değilse OpenCV penceresine düşülür
+- **Pillow** *(isteğe bağlı)* — HUD’da Türkçe karakterlerin doğru render edilmesi için; yoksa ASCII’ye sadeleştirilir
 
 Örnek kurulum:
 
 ```bash
-pip install opencv-python numpy rasterio pyproj tensorflow
+pip install opencv-python numpy rasterio pyproj tensorflow PyQt5 Pillow
 ```
 
 GPU isteğe bağlıdır; CPU ile de çalışır, model çıkarımı daha yavaş olur. Çok büyük rasterler için `OPENCV_IO_MAX_IMAGE_PIXELS` betik içinde yükseltilmiştir.
@@ -69,7 +71,23 @@ Proje kökünden (veya veri dosyalarının göreli yolların doğru çözüldü�
 python simulasyon_yonlendirme_uclu_dashboard.py
 ```
 
-Yapılandırma **komut satırı argümanı kullanmaz**; tüm parametreler `SimulationConfig` dataclass varsayılanlarıdır. Davranışı değiştirmek için ilgili sınıfı düzenleyin veya kodda `SimulationConfig(...)` örneği oluşturup `main()` içine bağlayın.
+Tüm varsayılanlar `SimulationConfig` dataclass içindedir; ayrıca sık değişen birkaç parametre **komut satırı argümanıyla** geçersiz kılınabilir:
+
+| Argüman | Karşılık |
+|---------|----------|
+| `--senaryo {normal,irtifa}` | `scenario_mode` |
+| `--referans YOL` | `reference_map_path` (dosya veya klasör) |
+| `--gozlem YOL` | `observation_map_path` |
+| `--model YOL` | `model_path` (dosya veya klasör) |
+| `--adim-px N` | `step_size` |
+| `--arama-penceresi N` | `base_search_window_size` |
+| `--kalman` / `--kalman-yok` | `kalman_enabled` |
+| `--csv-yok` | `log_csv_enabled=False` |
+| `--csv-dosya YOL` | `log_csv_path` |
+| `--otonom-aralik-ms MS` | `autonomous_step_interval_ms` |
+| `--rastgele-baslangic` / `--sabit-baslangic` | `random_start` |
+
+Verilmeyen argümanlar `SimulationConfig` varsayılanını korur. Daha geniş davranış değişikliği için sınıfı düzenleyin veya `SimulationConfig(...)` örneğini `main()` / `main_qt()` içine bağlayın.
 
 ---
 
@@ -154,7 +172,17 @@ Tanı çıktısı: `diagnostics/template_diag_YYYYMMDD_HHMMSS/` altında her vak
 | **+ / = / −** | İrtifa senaryosunda AGL artır/azalt (`altitude_step_m`) |
 | **ESC** veya **X** | Çıkış |
 
-OpenCV bazen ok tuşu kodları da üretir; kodda bu sanal kodlar da tanımlıdır.
+W A S D yerine ok tuşları da kullanılabilir; kodda bu sanal kodlar da tanımlıdır.
+
+### Mod ve işleme kısayolları
+
+| Tuş | İşlev |
+|-----|-------|
+| **P** | Otonom waypoint modunu aç/kapat (fare ile haritada hedef seçilir) |
+| **K** | Kalman filtresini aç/kapat |
+| **N** | Gözlem normalizasyon modunu döndür (`HAM → CLAHE → HISTEQ → EDGE`) |
+| **V** | Gözlem penceresi boyutunu değiştir (`544` ↔ `272`) |
+| **M** | Referans yama (eşleşen bölge) panelini aç/kapat |
 
 ### HUD / katman kısayolları
 

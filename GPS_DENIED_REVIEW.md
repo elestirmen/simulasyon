@@ -4,37 +4,34 @@
 Proje, gözlem haritasından üç pencere çıkarıp model ile üç template üretir ve bunları referans haritada `matchTemplate` ile arar. Eşleşen kutuların kesişimi konum tahmini olarak kullanılır.
 
 ### Temel zayıflıklar
-- Güven skoru olmadan tek-frame karar verildiği için hatalı eşleşme sonrası ROI kolayca yanlış yere kilitlenebilir.
-- Görev mantığı büyük ölçüde operatör komutuna bağlıydı; waypoint takibi ve yeniden bulma davranışı eksikti.
-- Nominal test noktaları vardı, fakat görev seviyesinde rota başarısı, yeniden bulma kabiliyeti ve düşük güven durumları ölçülmüyordu.
-- Önceki diagonal üçlü örnekleme, benzer dokularda ayrıştırıcılığı sınırlıyordu.
+- Güven skoru olmadan tek-frame karar verildiğinde hatalı eşleşme sonrası ROI kolayca yanlış yere kilitlenebilir.
+- Görev mantığı operatör komutuna bağlıydı; waypoint takibi ve düşük güvende yeniden kazanım davranışı eksikti.
+- Tek-adım görsel sıçramalar (yanlış eşleşme) takip merkezini ani biçimde kaydırabiliyordu.
 
 ### Eklenen iyileştirmeler
-- Yerelleştirme için güven skoru ve düşük güvene bağlı ROI büyütme eklendi.
-- Takip merkezi, ölçüm güvenine göre yumuşatılarak güncelleniyor.
-- Üçlü örnekleme diagonal yerine daha ayırt edici üçgen geometriye çekildi.
-- Görev başlangıcı için bilinen launch konumundan bootstrap desteği eklendi.
-- Otonom waypoint modu eklendi.
-- Otonom benchmark senaryoları eklendi:
-  - `baseline_box_route`
-  - `heading_bias_zigzag`
-  - `altitude_transition_route`
-  - `reacquire_after_dropout`
+Aşağıdakiler `gps_denied_autonomy.py` içinde tanımlı ve dashboard ana döngüsünde aktif kullanılır:
+- **Lokalizasyon kalitesi** (`compute_localization_quality`): normalize skorlar, `score_floor` / `score_mean`, merkez yayılımı (`center_spread_px`), birleşik `confidence` ve `is_reliable` bayrağı (eşikler `localization_*_threshold`).
+- **Düşük güvene bağlı ROI büyütme** (`update_search_window_size`): katı üçlü hizalama sağlandığında pencere tabana döner; aksi halde `search_window_growth_step` / `search_window_failure_growth` ile büyür.
+- **Sensör füzyonu** (`fuse_measurement_with_prior`): takip merkezi ölçüm güvenine göre yumuşatılır; `max_visual_jump_px` eşiğini aşan sıçramalar reddedilir.
+- **Kalman filtresi** (`PositionKalmanFilter`, K tuşu / `kalman_enabled`): sabit-hız modelli 2D konum filtresi; güvenilir ölçümlerde güncellenir.
+- **Otonom waypoint modu** (`choose_autonomous_action`, `update_waypoint_progress`): P tuşu ile açılır, fare ile harita üzerinde hedef seçilir; gövde-ekseni hizalama, ardışık kabul ve takılma (stuck) kurtarma içerir.
+
+> Not: Üçlü örnekleme hâlâ **diagonal** geometridedir (`get_observation_boxes`); offset vektörü başlık açısıyla döndürülür ama üç pencere eş-doğrusal kalır.
+
+### Tanılama (diagnostic) toplu çalıştırma
+Dashboard, üçlü şablon kalitesini ölçen bir tanılama modu içerir (`run_template_diagnostics`):
+- `SimulationConfig.diagnostic_benchmark_enabled = True` → başlangıçta çalışır.
+- `SimulationConfig.diagnostic_benchmark_only = True` → çıktı yazıldıktan sonra dashboard açılmadan çıkar.
+- Tohum noktaları: `SimulationConfig.diagnostic_benchmark_points`.
+
+Çıktılar `diagnostics/template_diag_YYYYMMDD_HHMMSS/` altına yazılır: her vaka için `case_XX_..._triptych.png`, `case_XX_..._meta.json` ve `summary.json`.
 
 ### Mühendislik yorumu
-- Yazılım mühendisi gözüyle: proje artık algı, takip ve görev mantığını daha temiz katmanlara ayırıyor.
-- İHA mühendisi gözüyle: düşük güven durumunda agresif ilerlemek yerine yeniden kazanım davranışı kullanılıyor; başlangıçta bilinen kalkış bölgesi varsa görsel takip daha kararlı başlıyor.
-- Uçak mühendisi gözüyle: heading ve irtifa değişiminin görev başarısına etkisi artık senaryo seviyesinde ölçülebiliyor.
-- Bilimsel gözle: çıktı yalnızca görsel değil; rota bazlı başarı, hata ve güven metrikleri JSON olarak dışa aktarılıyor.
+- Yazılım mühendisi gözüyle: algı (`localize_template_triplet`), kalite/füzyon (`gps_denied_autonomy`) ve görev mantığı (otonom döngü) ayrı katmanlara ayrılmış durumda.
+- İHA mühendisi gözüyle: düşük güvende agresif ilerleme yerine dönüş/yeniden kazanım tercih ediliyor; Kalman açıkken arama çerçevesi filtre konumuna odaklanarak tek-adım hatalarına dayanıklılık artıyor.
+- Bilimsel gözle: her adım CSV'ye (`log_simulasyon_*.csv`) skor, güven, yayılım, ham/Kalman hata (px ve m) olarak yazılır; tanılama vakaları PNG/JSON olarak dışa aktarılır.
 
 ### Çalıştırma
-- Dashboard manuel kullanım: `simulasyon_yonlendirme_uclu_dashboard.py`
-- Otonom waypoint modu için:
-  - `SimulationConfig.autonomous_mode_enabled = True`
-- Bilinen başlangıç konumundan başlatmak için:
-  - `SimulationConfig.bootstrap_tracking_from_start = True`
-- Benchmark için:
-  - `SimulationConfig.mission_benchmark_enabled = True`
-  - Sadece benchmark çalıştırmak için `SimulationConfig.mission_benchmark_only = True`
-
-Benchmark çıktıları `diagnostics/mission_bench_*` klasörüne yazılır.
+- Manuel dashboard: `python simulasyon_yonlendirme_uclu_dashboard.py`
+- Otonom waypoint modu: `SimulationConfig.autonomous_mode_enabled = True` (veya çalışırken **P**).
+- Tanılama: `SimulationConfig.diagnostic_benchmark_enabled = True` (yalnız tanılama için ayrıca `diagnostic_benchmark_only = True`).
