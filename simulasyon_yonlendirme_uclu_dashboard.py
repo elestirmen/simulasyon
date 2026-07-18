@@ -210,9 +210,9 @@ class SimulationConfig:
     reference_map_path: Path = MAP_DIRECTORY
     observation_map_path: Path = Path("parcalar/urgup_bingmap_30cm_utm.tif")
     observation_georef_path: Path = Path("parcalar/urgup_bingmap_30cm_utm.tif")
-    observation_grid_georef_path: Optional[Path] = Path(
-        "haritalar/ana_harita_urgup_30_cm__new_GPU_model_f32_k3_epoch_00001_sigmoid_(1_ 1)_06_10_2022_son_model.h5.jpg_geo.tif_UTM_geo_r.tif"
-    )
+    # None ise observation_georef_path kullanılır. Eski sabitlenmiş türetilmiş
+    # raster adı artık veri paketinde bulunmadığından taşınabilir varsayılan budur.
+    observation_grid_georef_path: Optional[Path] = None
     dem_path: Path = Path("ana_harita_urgup_30_cm_utm_elevation.tif")
     model_path: Path = MODEL_DIRECTORY
     sample_window_size: int = 544
@@ -222,6 +222,7 @@ class SimulationConfig:
     template_offset: int = 100
     initial_row: int = 2500
     initial_col: int = 2500
+    initial_position_known: bool = True
     random_start: bool = True
     random_start_middle_band_ratio: float = 0.50
     step_size: int = 250
@@ -239,6 +240,7 @@ class SimulationConfig:
     align_observation_to_reference_grid: bool = True
     stream_rasters: bool = True
     display_size: Tuple[int, int] = (1000, 1000)
+    mission_control_canvas_size: Tuple[int, int] = (1600, 900)
     left_panel_width_ratio: float = 0.20
     right_info_panel_width: int = 180
     match_method: int = cv2.TM_CCOEFF_NORMED
@@ -305,9 +307,15 @@ class SimulationConfig:
         (18000, 12000),
     )
     # --- Lokalizasyon kalitesi eşikleri ---
-    localization_score_threshold: float = 0.35
-    localization_confidence_threshold: float = 0.40
+    localization_score_threshold: float = 0.24
+    localization_confidence_threshold: float = 0.31
     localization_spread_threshold_px: float = 120.0
+    localization_peak_margin_threshold: float = 0.03
+    localization_template_std_threshold: float = 2.0
+    localization_require_strict_triplet: bool = True
+    global_recovery_after_low_confidence_steps: int = 3
+    global_recovery_min_window_size: int = 6000
+    progressive_global_recovery: bool = True
     # --- Sensör füzyonu ---
     sensor_fusion_blend_gain: float = 0.75
     max_visual_jump_px: float = 600.0
@@ -348,6 +356,14 @@ class ReferencePreviewState:
     base_preview: np.ndarray
 
 
+@dataclass(frozen=True)
+class TemplateMatchEvidence:
+    score: float
+    top_left: Tuple[int, int]
+    peak_margin: float
+    template_stddev: float
+
+
 @dataclass
 class TerrainContext:
     dem_dataset: object
@@ -383,6 +399,7 @@ _CSV_FIELDNAMES = (
     "hata_px", "kalman_hata_px",
     "hata_m", "kalman_hata_m",
     "guven", "skor_min", "skor_ort", "yayilma_px",
+    "tepe_marji_min", "sablon_std_min", "geometri_siki",
     "guvenilir", "guvenilirlik_neden", "arama_pencere_px", "islem_ms",
 )
 
@@ -503,6 +520,9 @@ def _write_csv_row(
         "skor_min": round(quality.score_floor, 4),
         "skor_ort": round(quality.score_mean, 4),
         "yayilma_px": round(quality.center_spread_px, 2),
+        "tepe_marji_min": round(quality.peak_margin_floor, 5),
+        "sablon_std_min": round(quality.template_std_floor, 3),
+        "geometri_siki": int(quality.strict_alignment),
         "guvenilir": int(quality.is_reliable),
         "guvenilirlik_neden": quality.reason,
         "arama_pencere_px": search_window_size,
@@ -812,10 +832,6 @@ def get_effective_template_size(config: SimulationConfig) -> int:
     return _scale_model_pixels(config.template_size, config)
 
 
-def get_effective_crop_margin(config: SimulationConfig) -> int:
-    return _scale_model_pixels(config.crop_margin, config, minimum=0)
-
-
 def get_effective_template_offset(config: SimulationConfig) -> int:
     return _scale_model_pixels(config.template_offset, config)
 
@@ -823,26 +839,31 @@ def get_effective_template_offset(config: SimulationConfig) -> int:
 def resize_templates_to_effective_size(
     templates: List[np.ndarray],
     config: SimulationConfig,
+    scale_factors: Optional[Tuple[float, ...]] = None,
 ) -> List[np.ndarray]:
-    effective_size = get_effective_template_size(config)
-    if effective_size == config.template_size:
-        return templates
-    return [
-        cv2.resize(template, (effective_size, effective_size), interpolation=cv2.INTER_AREA)
-        for template in templates
-    ]
-
-
-def infer_matched_template_scale(
-    matched_boxes: List[Tuple[int, int, int, int]],
-    config: SimulationConfig,
-) -> float:
-    if not matched_boxes or config.template_size <= 0:
-        return 1.0
-    widths = [max(1, int(box[2])) for box in matched_boxes]
-    heights = [max(1, int(box[3])) for box in matched_boxes]
-    matched_size = (sum(widths) + sum(heights)) / float(2 * len(matched_boxes))
-    return max(0.05, float(matched_size) / float(config.template_size))
+    base_size = get_effective_template_size(config)
+    factors = scale_factors or tuple(1.0 for _ in templates)
+    if len(factors) != len(templates):
+        raise ValueError("Her şablon için bir ölçek katsayısı gerekli.")
+    resized_templates = []
+    for template, scale_factor in zip(templates, factors, strict=True):
+        target_size = max(1, int(round(base_size * max(0.05, float(scale_factor)))))
+        if template.shape[:2] == (target_size, target_size):
+            resized_templates.append(template)
+            continue
+        interpolation = (
+            cv2.INTER_AREA
+            if target_size < max(template.shape[:2])
+            else cv2.INTER_LINEAR
+        )
+        resized_templates.append(
+            cv2.resize(
+                template,
+                (target_size, target_size),
+                interpolation=interpolation,
+            )
+        )
+    return resized_templates
 
 
 def validate_config(config: SimulationConfig) -> None:
@@ -1971,15 +1992,32 @@ def get_observation_boxes(
 def get_template_boxes_from_observation_boxes(
     observation_boxes: List[Tuple[int, int, int, int]],
     config: SimulationConfig,
+    scale_factors: Optional[Tuple[float, ...]] = None,
 ) -> List[Tuple[int, int, int, int]]:
     # Pencere boyutu model girdisinden küçükse (272 modu), model çıktısındaki
     # 512 px şablon gerçek haritada 256 px'e karşılık gelir.
-    eff_size = get_effective_template_size(config)
-    eff_inset = get_effective_crop_margin(config)
-    return [
-        (x + eff_inset, y + eff_inset, eff_size, eff_size)
-        for x, y, _, _ in observation_boxes
-    ]
+    base_size = get_effective_template_size(config)
+    factors = scale_factors or tuple(1.0 for _ in observation_boxes)
+    if len(factors) != len(observation_boxes):
+        raise ValueError("Her gözlem kutusu için bir ölçek katsayısı gerekli.")
+    template_boxes = []
+    for (x, y, width, height), scale_factor in zip(
+        observation_boxes,
+        factors,
+        strict=True,
+    ):
+        target_size = max(1, int(round(base_size * max(0.05, float(scale_factor)))))
+        center_x = x + (width / 2.0)
+        center_y = y + (height / 2.0)
+        template_boxes.append(
+            (
+                int(round(center_x - (target_size / 2.0))),
+                int(round(center_y - (target_size / 2.0))),
+                target_size,
+                target_size,
+            )
+        )
+    return template_boxes
 
 
 def rotate_square_capture(
@@ -2171,7 +2209,11 @@ def extract_template_triplet(
 
     model_input_triplet = prepare_triplet_for_model(observation_windows, config, norm_mode)
     templates = predict_template_triplet(model, model_input_triplet, config)
-    template_boxes = get_template_boxes_from_observation_boxes(observation_boxes, config)
+    template_boxes = get_template_boxes_from_observation_boxes(
+        observation_boxes,
+        config,
+        altitude_state.patch_scale_factors,
+    )
 
     return (
         templates,
@@ -2198,21 +2240,75 @@ def extract_match_score_and_location(
     return float(max_val), max_loc
 
 
+def extract_match_evidence(
+    response_map: np.ndarray,
+    template: np.ndarray,
+    match_method: int,
+) -> TemplateMatchEvidence:
+    score, top_left = extract_match_score_and_location(response_map, match_method)
+    response_height, response_width = response_map.shape[:2]
+    radius_x = max(2, int(template.shape[1] // 3))
+    radius_y = max(2, int(template.shape[0] // 3))
+    x0 = max(0, top_left[0] - radius_x)
+    x1 = min(response_width, top_left[0] + radius_x + 1)
+    y0 = max(0, top_left[1] - radius_y)
+    y1 = min(response_height, top_left[1] + radius_y + 1)
+    excluded = response_map[y0:y1, x0:x1].copy()
+    try:
+        response_map[y0:y1, x0:x1] = (
+            float("inf") if is_sqdiff_method(match_method) else float("-inf")
+        )
+        second_score, _ = extract_match_score_and_location(
+            response_map,
+            match_method,
+        )
+    finally:
+        response_map[y0:y1, x0:x1] = excluded
+    if not math.isfinite(second_score):
+        peak_margin = 0.0
+    elif is_sqdiff_method(match_method):
+        peak_margin = max(0.0, float(second_score - score))
+    else:
+        peak_margin = max(0.0, float(score - second_score))
+    return TemplateMatchEvidence(
+        score=float(score),
+        top_left=(int(top_left[0]), int(top_left[1])),
+        peak_margin=peak_margin,
+        template_stddev=float(np.std(template)),
+    )
+
+
 def run_template_match(
     reference_map: np.ndarray,
     template: np.ndarray,
     match_method: int,
-) -> Tuple[float, Tuple[int, int]]:
+) -> TemplateMatchEvidence:
+    template_stddev = float(np.std(template))
+    if template_stddev <= 1e-6:
+        return TemplateMatchEvidence(
+            score=(float("inf") if is_sqdiff_method(match_method) else 0.0),
+            top_left=(0, 0),
+            peak_margin=0.0,
+            template_stddev=template_stddev,
+        )
     response_map = cv2.matchTemplate(reference_map, template, match_method, None)
-    return extract_match_score_and_location(response_map, match_method)
+    return extract_match_evidence(response_map, template, match_method)
 
 
 def run_template_match_pyramid(
     search_region: np.ndarray,
     template: np.ndarray,
     config: SimulationConfig,
-) -> Tuple[float, Tuple[int, int]]:
+) -> TemplateMatchEvidence:
     match_method = config.match_method
+    template_stddev = float(np.std(template))
+    if template_stddev <= 1e-6:
+        return TemplateMatchEvidence(
+            score=(float("inf") if is_sqdiff_method(match_method) else 0.0),
+            top_left=(0, 0),
+            peak_margin=0.0,
+            template_stddev=template_stddev,
+        )
     region_height, region_width = search_region.shape[:2]
     template_height, template_width = template.shape[:2]
     result_height = region_height - template_height + 1
@@ -2220,7 +2316,12 @@ def run_template_match_pyramid(
 
     if result_height <= 0 or result_width <= 0:
         fallback_score = float("inf") if is_sqdiff_method(match_method) else float("-inf")
-        return fallback_score, (0, 0)
+        return TemplateMatchEvidence(
+            score=fallback_score,
+            top_left=(0, 0),
+            peak_margin=0.0,
+            template_stddev=float(np.std(template)),
+        )
 
     scale = float(config.coarse_scale)
     small_width = max(1, int(region_width * scale))
@@ -2235,6 +2336,7 @@ def run_template_match_pyramid(
     ):
         coarse_x = result_width // 2
         coarse_y = result_height // 2
+        coarse_peak_margin = 0.0
     else:
         region_small = cv2.resize(
             search_region,
@@ -2250,10 +2352,17 @@ def run_template_match_pyramid(
         if coarse_response.size == 0:
             coarse_x = result_width // 2
             coarse_y = result_height // 2
+            coarse_peak_margin = 0.0
         else:
-            _, coarse_loc = extract_match_score_and_location(coarse_response, match_method)
+            coarse_evidence = extract_match_evidence(
+                coarse_response,
+                template_small,
+                match_method,
+            )
+            coarse_loc = coarse_evidence.top_left
             coarse_x = int(coarse_loc[0] / scale)
             coarse_y = int(coarse_loc[1] / scale)
+            coarse_peak_margin = coarse_evidence.peak_margin
 
     pad = max(8, int(max(template_width, template_height) * config.roi_pad_factor))
     x1 = max(0, coarse_x - pad)
@@ -2268,15 +2377,20 @@ def run_template_match_pyramid(
 
     region_roi = search_region[y1 : y2 + template_height, x1 : x2 + template_width]
     roi_response = cv2.matchTemplate(region_roi, template, match_method, None)
-    score, top_left = extract_match_score_and_location(roi_response, match_method)
-    return score, (top_left[0] + x1, top_left[1] + y1)
+    fine_evidence = extract_match_evidence(roi_response, template, match_method)
+    return TemplateMatchEvidence(
+        score=fine_evidence.score,
+        top_left=(fine_evidence.top_left[0] + x1, fine_evidence.top_left[1] + y1),
+        peak_margin=min(coarse_peak_margin, fine_evidence.peak_margin),
+        template_stddev=fine_evidence.template_stddev,
+    )
 
 
 def match_three(
     search_region: np.ndarray,
     templates: List[np.ndarray],
     config: SimulationConfig,
-) -> Tuple[List[Tuple[float, Tuple[int, int]]], str]:
+) -> Tuple[List[TemplateMatchEvidence], str]:
     if config.use_pyramid_matching:
         worker = lambda template: run_template_match_pyramid(search_region, template, config)
         backend_label = "parallel-pyramid" if config.use_parallel_matching else "serial-pyramid"
@@ -2369,14 +2483,16 @@ def extract_search_region(
     search_window_size: int,
     step_count: int,
     config: SimulationConfig,
+    force_global: bool = False,
 ) -> Tuple[np.ndarray, Tuple[int, int], Tuple[int, int, int, int], str]:
-    force_global = (
-        previous_predicted_center is None
+    should_search_global = (
+        bool(force_global)
+        or previous_predicted_center is None
         or config.global_refresh_interval > 0
         and step_count > 0
         and (step_count % config.global_refresh_interval) == 0
     )
-    if force_global:
+    if should_search_global:
         full_box = (0, 0, reference_map.shape[1], reference_map.shape[0])
         materialize = getattr(reference_map, "read_full", None)
         full_map = materialize() if callable(materialize) else reference_map
@@ -2397,7 +2513,14 @@ def localize_template_triplet(
     templates: List[np.ndarray],
     config: SimulationConfig,
     match_downsample_size: int = 0,
-) -> Tuple[List[float], List[Tuple[int, int, int, int]], Tuple[int, int, int, int], str, str]:
+) -> Tuple[
+    List[float],
+    List[Tuple[int, int, int, int]],
+    Tuple[int, int, int, int],
+    str,
+    str,
+    List[TemplateMatchEvidence],
+]:
     scores = []
     matched_boxes = []
 
@@ -2427,8 +2550,8 @@ def localize_template_triplet(
         match_results,
         strict=True,
     ):
-        score, local_top_left = match_result
-        scores.append(score)
+        local_top_left = match_result.top_left
+        scores.append(match_result.score)
         matched_boxes.append(
             (
                 int(round(local_top_left[0] / ds_scale)) + search_origin[0],
@@ -2439,7 +2562,14 @@ def localize_template_triplet(
         )
 
     intersection_box, intersection_mode = compute_intersection_box(matched_boxes)
-    return scores, matched_boxes, intersection_box, intersection_mode, match_backend
+    return (
+        scores,
+        matched_boxes,
+        intersection_box,
+        intersection_mode,
+        match_backend,
+        match_results,
+    )
 
 
 def get_box_center(box: Tuple[int, int, int, int]) -> Tuple[int, int]:
@@ -2479,11 +2609,11 @@ def is_strict_triplet_alignment(
     midpoint_y = (center_a[1] + center_c[1]) / 2.0
     midpoint_error = math.hypot(center_b[0] - midpoint_x, center_b[1] - midpoint_y)
 
-    matched_template_scale = infer_matched_template_scale(matched_boxes, config)
-    expected_offset = float(config.template_offset) * matched_template_scale
+    observation_scale = get_observation_model_scale(config)
+    expected_offset = float(config.template_offset) * observation_scale
     alignment_tolerance = max(
         8.0,
-        float(config.triplet_alignment_tolerance_px) * matched_template_scale,
+        float(config.triplet_alignment_tolerance_px) * observation_scale,
     )
 
     # Başlık açısına göre döndürülmüş beklenen delta
@@ -3500,7 +3630,17 @@ def run_template_diagnostics(
             predicted_intersection_box,
             intersection_mode,
             match_backend,
-        ) = localize_template_triplet(search_region, search_origin, templates, config)
+            match_evidence,
+        ) = localize_template_triplet(
+            search_region,
+            search_origin,
+            resize_templates_to_effective_size(
+                templates,
+                config,
+                altitude_state.patch_scale_factors,
+            ),
+            config,
+        )
         predicted_center = get_box_center(predicted_intersection_box)
         error_pixels = compute_error_pixels(predicted_center, actual_center)
 
@@ -3530,6 +3670,12 @@ def run_template_diagnostics(
             "intersection_mode": intersection_mode,
             "search_mode": search_mode,
             "match_backend": match_backend,
+            "peak_margins": [
+                float(evidence.peak_margin) for evidence in match_evidence
+            ],
+            "template_stddevs": [
+                float(evidence.template_stddev) for evidence in match_evidence
+            ],
             "search_window_box": list(search_window_box),
             "actual_boxes": [list(box) for box in actual_boxes],
             "matched_boxes": [list(box) for box in matched_boxes],
@@ -4254,18 +4400,58 @@ def update_search_window_size(
     config: SimulationConfig,
     heading_degrees: float = 0.0,
     use_kalman: bool = False,
+    quality_reliable: bool = True,
+    reference_map_shape: Optional[Tuple[int, int]] = None,
 ) -> int:
+    factor = float(config.kalman_window_growth_factor) if use_kalman else 1.0
+    maximum_window_size = config.max_search_window_size
+    if config.progressive_global_recovery and reference_map_shape is not None:
+        maximum_window_size = max(
+            maximum_window_size,
+            int(max(reference_map_shape[:2])),
+        )
+    if not quality_reliable:
+        return min(
+            maximum_window_size,
+            current_search_window_size
+            + max(1, int(config.search_window_failure_growth * factor)),
+        )
     if is_strict_triplet_alignment(matched_boxes, intersection_mode, config, heading_degrees):
         return config.base_search_window_size
-    factor = float(config.kalman_window_growth_factor) if use_kalman else 1.0
     if intersection_mode in ("abc", "ab", "bc", "ac"):
         return min(
-            config.max_search_window_size,
+            maximum_window_size,
             current_search_window_size + max(1, int(config.search_window_growth_step * factor)),
         )
     return min(
-        config.max_search_window_size,
+        maximum_window_size,
         current_search_window_size + max(1, int(config.search_window_failure_growth * factor)),
+    )
+
+
+def should_force_global_recovery(
+    search_anchor_center: Optional[Tuple[int, int]],
+    low_confidence_steps: int,
+    current_search_window_size: int,
+    config: SimulationConfig,
+    reference_map_shape: Optional[Tuple[int, int]] = None,
+) -> bool:
+    minimum_recovery_window = min(
+        config.max_search_window_size,
+        max(config.base_search_window_size, config.global_recovery_min_window_size),
+    )
+    if config.progressive_global_recovery and reference_map_shape is not None:
+        # Tam taramaya ancak turuncu ROI zaten haritanın tüm uzun kenarını
+        # kaplayacak kadar büyüdüğünde geç. Böylece görünüm bir anda sıçramaz.
+        minimum_recovery_window = max(
+            minimum_recovery_window,
+            int(max(reference_map_shape[:2])),
+        )
+    return bool(
+        search_anchor_center is not None
+        and low_confidence_steps
+        >= max(1, config.global_recovery_after_low_confidence_steps)
+        and current_search_window_size >= minimum_recovery_window
     )
 
 
@@ -4297,6 +4483,22 @@ def choose_initial_cursor(
             config.random_start_middle_band_ratio,
         ),
     )
+
+
+def seed_known_initial_position(
+    previous_predicted_center: Optional[Tuple[int, int]],
+    actual_center: Tuple[int, int],
+    step_count: int,
+    config: SimulationConfig,
+) -> Optional[Tuple[int, int]]:
+    """Use the declared start fix as a prior, without exposing later truth."""
+    if (
+        config.initial_position_known
+        and step_count == 0
+        and previous_predicted_center is None
+    ):
+        return actual_center
+    return previous_predicted_center
 
 
 def main(
@@ -4342,6 +4544,7 @@ def main(
         heading_degrees = normalize_heading_degrees(config.initial_heading_degrees)
         altitude_agl_m = clamp_altitude_agl(config.initial_altitude_agl_m, config)
         previous_predicted_center: Optional[Tuple[int, int]] = None
+        tentative_search_center: Optional[Tuple[int, int]] = None
         search_window_size = config.base_search_window_size
         kalman: Optional[PositionKalmanFilter] = None
         low_confidence_steps = 0
@@ -4408,27 +4611,71 @@ def main(
                 )
                 altitude_agl_m = altitude_state.altitude_agl_m
                 actual_intersection_box, _ = compute_intersection_box(actual_boxes)
+                actual_center = get_box_center(actual_intersection_box)
 
-                search_anchor_center = previous_predicted_center
-                if search_anchor_center is None and step_count == 0:
-                    search_anchor_center = get_box_center(actual_intersection_box)
+                # Senaryoda yalnız ilk konum bilinir. Bu açık başlangıç sabiti,
+                # ilk eşlemeyi tam harita yerine turuncu ROI içinde başlatır;
+                # sonraki gerçek konumlar lokalizasyon durumuna enjekte edilmez.
+                previous_predicted_center = seed_known_initial_position(
+                    previous_predicted_center,
+                    actual_center,
+                    step_count,
+                    config,
+                )
+
+                motion_prior_center = propagate_center_with_action(
+                    previous_predicted_center,
+                    last_action,
+                    heading_degrees,
+                    last_action_step_size,
+                )
+                motion_tentative_center = propagate_center_with_action(
+                    tentative_search_center,
+                    last_action,
+                    heading_degrees,
+                    last_action_step_size,
+                )
+                search_anchor_center = (
+                    motion_prior_center
+                    if motion_prior_center is not None
+                    else motion_tentative_center
+                )
+                force_global_recovery = should_force_global_recovery(
+                    search_anchor_center,
+                    low_confidence_steps,
+                    current_search_window_size,
+                    config,
+                    reference_map.shape,
+                )
                 search_region, search_origin, _search_window_box, search_mode = extract_search_region(
                     reference_map, search_anchor_center, current_search_window_size,
-                    step_count, config,
+                    step_count, config, force_global=force_global_recovery,
                 )
                 # Arama bölgesi 1:1 ölçekte kalır; modelin 512 px çıktısı,
                 # aktif gözlem penceresinin gerçek harita ölçeğine indirilir.
                 _match_templates = resize_templates_to_effective_size(
                     templates,
                     runtime_match_config,
+                    altitude_state.patch_scale_factors,
                 )
-                score_values, matched_boxes, predicted_intersection_box, intersection_mode, match_backend = (
-                    localize_template_triplet(search_region, search_origin, _match_templates, config, 0)
+                (
+                    score_values,
+                    matched_boxes,
+                    predicted_intersection_box,
+                    intersection_mode,
+                    match_backend,
+                    match_evidence,
+                ) = (
+                    localize_template_triplet(
+                        search_region,
+                        search_origin,
+                        _match_templates,
+                        config,
+                        0,
+                    )
                 )
 
                 raw_predicted_center = get_box_center(predicted_intersection_box)
-                actual_center = get_box_center(actual_intersection_box)
-
                 # --- Lokalizasyon kalitesi (gps_denied_autonomy) ---
                 quality = compute_localization_quality(
                     score_values,
@@ -4439,34 +4686,59 @@ def main(
                     config.localization_score_threshold,
                     config.localization_confidence_threshold,
                     config.localization_spread_threshold_px,
+                    peak_margins=tuple(
+                        evidence.peak_margin for evidence in match_evidence
+                    ),
+                    peak_margin_threshold=config.localization_peak_margin_threshold,
+                    template_stddevs=tuple(
+                        evidence.template_stddev for evidence in match_evidence
+                    ),
+                    template_std_threshold=config.localization_template_std_threshold,
+                    strict_alignment=(
+                        is_strict_triplet_alignment(
+                            matched_boxes,
+                            intersection_mode,
+                            runtime_match_config,
+                            heading_degrees,
+                        )
+                        if config.localization_require_strict_triplet
+                        else None
+                    ),
                 )
 
                 # --- Kalman filtresi (K tuşuyla çalışma anında aç/kapat) ---
                 use_kalman = bool(runtime_ui_state.get("kalman_on", config.kalman_enabled))
                 if use_kalman:
+                    kalman_initialized_from_current_measurement = False
                     if kalman is None:
-                        # Yeni açıldıysa mevcut fused center'dan başlat
-                        init_pos = (
-                            previous_predicted_center
-                            if previous_predicted_center is not None
-                            else (search_anchor_center if search_anchor_center is not None else actual_center)
-                        )
-                        kalman = PositionKalmanFilter(
-                            init_pos, config.kalman_process_noise, config.kalman_measurement_noise,
-                        )
-                    moved = propagate_center_with_action(
-                        (0, 0), last_action, heading_degrees, last_action_step_size,
-                    )
-                    kalman.predict(
-                        float(moved[0]) if moved is not None else 0.0,
-                        float(moved[1]) if moved is not None else 0.0,
-                    )
-                    if quality.is_reliable:
-                        kalman.update(
-                            float(raw_predicted_center[0]),
-                            float(raw_predicted_center[1]),
-                            quality.confidence,
-                        )
+                        init_pos = previous_predicted_center
+                        if init_pos is None and quality.is_reliable:
+                            init_pos = raw_predicted_center
+                            kalman_initialized_from_current_measurement = True
+                        if init_pos is not None:
+                            kalman = PositionKalmanFilter(
+                                init_pos,
+                                config.kalman_process_noise,
+                                config.kalman_measurement_noise,
+                            )
+                    if kalman is not None:
+                        # Filtre bu adımın görsel ölçümünden kurulmuşsa hareket zaten
+                        # ölçümün içindedir; aynı komutu yeniden uygulamak konumu iki
+                        # kez ilerletir ve bir sonraki ROI merkezini kaydırır.
+                        if not kalman_initialized_from_current_measurement:
+                            moved = propagate_center_with_action(
+                                (0, 0), last_action, heading_degrees, last_action_step_size,
+                            )
+                            kalman.predict(
+                                float(moved[0]) if moved is not None else 0.0,
+                                float(moved[1]) if moved is not None else 0.0,
+                            )
+                        if quality.is_reliable:
+                            kalman.update(
+                                float(raw_predicted_center[0]),
+                                float(raw_predicted_center[1]),
+                                quality.confidence,
+                            )
                 else:
                     # Kalman kapalıyken filtreyi sıfırla; sonraki açılışta yeniden başlasın
                     kalman = None
@@ -4476,9 +4748,9 @@ def main(
                 )
 
                 # --- Sensör füzyonu ---
-                _prior_was_none = previous_predicted_center is None
+                _prior_was_none = motion_prior_center is None
                 fused_center, _fusion_ok, _jump_px = fuse_measurement_with_prior(
-                    previous_predicted_center,
+                    motion_prior_center,
                     raw_predicted_center,
                     quality,
                     config.max_visual_jump_px,
@@ -4486,7 +4758,7 @@ def main(
                 )
                 # Step-0'da prior yokken kalite düşükse güvenli başlangıç konumuna dön
                 if _prior_was_none and not _fusion_ok:
-                    previous_predicted_center = actual_center
+                    previous_predicted_center = None
                 elif kalman_center is not None and use_kalman:
                     # Kalman açıkken arama çerçevesi Kalman pozisyonuna odaklanır;
                     # tek-adım yanlış eşleşmelerine karşı daha dayanıklı
@@ -4494,12 +4766,39 @@ def main(
                 else:
                     previous_predicted_center = fused_center
 
+                if previous_predicted_center is not None and quality.is_reliable:
+                    tentative_search_center = None
+                elif previous_predicted_center is None:
+                    candidate_is_usable_for_roi = (
+                        quality.reason != "template_variance"
+                        and all(math.isfinite(value) for value in raw_predicted_center)
+                    )
+                    tentative_search_center = (
+                        raw_predicted_center
+                        if candidate_is_usable_for_roi
+                        else motion_tentative_center
+                    )
+
                 search_window_size = update_search_window_size(
-                    current_search_window_size, matched_boxes, intersection_mode, config, heading_degrees,
+                    current_search_window_size,
+                    matched_boxes,
+                    intersection_mode,
+                    runtime_match_config,
+                    heading_degrees,
                     use_kalman=use_kalman,
+                    quality_reliable=quality.is_reliable,
+                    reference_map_shape=reference_map.shape,
                 )
 
-                low_confidence_steps = 0 if quality.is_reliable else low_confidence_steps + 1
+                low_confidence_steps = (
+                    0
+                    if quality.is_reliable
+                    else (
+                        2
+                        if search_mode == "global"
+                        else low_confidence_steps + 1
+                    )
+                )
 
                 display_predicted_center = (
                     kalman_center if kalman_center is not None else fused_center
@@ -4526,7 +4825,7 @@ def main(
                         display_predicted_center,
                         (waypoint_target,),
                         config.waypoint_acceptance_radius_px,
-                        quality.confidence,
+                        quality.confidence if quality.is_reliable else 0.0,
                         config.waypoint_acceptance_confidence_threshold,
                         config.waypoint_required_consecutive_hits,
                     )
@@ -4598,7 +4897,10 @@ def main(
                     score_values, matched_boxes, predicted_intersection_box,
                     actual_intersection_box, row, col, error_pixels, step_count,
                     last_action, heading_degrees, altitude_state, intersection_mode,
-                    search_mode, match_backend, current_search_window_size, config,
+                    search_mode,
+                    match_backend,
+                    current_search_window_size,
+                    runtime_match_config,
                 )
 
                 processing_ms = (time.perf_counter() - step_started_at) * 1000.0
@@ -4635,7 +4937,7 @@ def main(
                     search_window_size=current_search_window_size,
                     ui_state=runtime_ui_state,
                     runtime_ui_buttons=runtime_ui_buttons,
-                    config=config,
+                    config=runtime_match_config,
                     kalman_center=kalman_center,
                     waypoint_target=waypoint_target,
                     autonomous_mode=autonomous_mode,
@@ -4666,6 +4968,14 @@ def main(
                             "reliable": quality.is_reliable,
                             "reason": quality.reason,
                             "scores": tuple(float(score) for score in score_values),
+                            "peak_margins": tuple(
+                                float(evidence.peak_margin)
+                                for evidence in match_evidence
+                            ),
+                            "template_stddevs": tuple(
+                                float(evidence.template_stddev)
+                                for evidence in match_evidence
+                            ),
                             "intersection_mode": intersection_mode,
                             "search_mode": search_mode,
                             "search_window_px": current_search_window_size,
@@ -4673,6 +4983,8 @@ def main(
                             "action": get_action_label(last_action),
                             "kalman_on": use_kalman,
                             "autonomous": autonomous_mode,
+                            "obs_window_size": runtime_obs_window_size,
+                            "norm_mode": runtime_ui_state.get("norm_mode", "HISTEQ"),
                             "processing_ms": processing_ms,
                         }
                     )
@@ -4749,8 +5061,14 @@ def main(
                         # Kalman toggle: bir sonraki adımda kalman bloğu sıfırlanacak;
                         # şimdilik HUD'ı güncelle
                         dashboard = draw_localization_dashboard(**_dash_kw)
-                        # Kalman veya ref-patch toggle → layout değişir, hemen sonraki adıma geç
-                        if key in KALMAN_TOGGLE_KEYS or key in REF_PATCH_TOGGLE_KEYS:
+                        # İşlem yöntemleri yeni model/eşleme sonucu üretmelidir;
+                        # yalnız HUD etiketini değiştirmek kullanıcıyı yanıltır.
+                        if (
+                            key in KALMAN_TOGGLE_KEYS
+                            or key in NORM_CYCLE_KEYS
+                            or key in OBS_WINDOW_CYCLE_KEYS
+                            or key in REF_PATCH_TOGGLE_KEYS
+                        ):
                             last_action = "hold"
                             last_action_step_size = 0.0
                             step_count += 1
@@ -4873,9 +5191,19 @@ def main_qt(config=None) -> None:
     config = resolve_config_paths(config)
     from mission_control_ui import run_mission_control
 
+    # Qt kabuğu eski OpenCV yan panellerini ayrı bileşenler olarak gösterir.
+    # İç kompozisyonu geniş formata almak, ortadaki harita karesinin dar/küçük
+    # üretilmesini önler; Qt tarafı görüntü oranını koruyarak ölçekler.
+    mission_control_config = dataclasses.replace(
+        config,
+        display_size=config.mission_control_canvas_size,
+        left_panel_width_ratio=0.12,
+        right_info_panel_width=130,
+    )
+
     raise SystemExit(
         run_mission_control(
-            config,
+            mission_control_config,
             main,
             _runtime_buttons_mouse_cb,
             _QT_KEY_MAP,

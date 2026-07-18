@@ -117,8 +117,9 @@ Verilmeyen argümanlar `SimulationConfig` varsayılanını korur. Daha geniş da
 2. **Üçlü çıkarım** — Gözlem üzerinde başlığa göre döndürülmüş büyük bir yakalama alanından üç komşu pencere; her biri modele girer, çıkan şablonlar referansta aranır.
 3. **Eşleştirme** — `cv2.matchTemplate` (varsayılan `TM_CCOEFF_NORMED`); isteğe bağlı **piramit** (`coarse_scale` + dar ROI) ve **3 iş parçacığı** ile üç şablon paralel.
 4. **Kesişim** — Üç eşleşme kutusunun kesişimi veya çiftler üzerinden `intersection_mode` (ör. `abc`, `ab`, …).
-5. **Arama penceresi** — İlk adımda gerçek kesişim merkezi çapa yardımcı olur; sonraki adımlarda **katı üçlü hizalama** (`is_strict_triplet_alignment`) sağlanırsa tahmin güncellenir ve taban pencere boyutuna dönülür; aksi halde pencere `search_window_growth_step` veya `search_window_failure_growth` ile büyür (üst sınır `max_search_window_size`).
-6. **Global arama** — Önceki tahmin yoksa veya `global_refresh_interval > 0` ile periyodik olarak tüm referans harita kullanılır.
+5. **Güven kapısı** — Düşük varyanslı şablon, zayıf skor, geometrik üçlü uyumsuzluğu ve belirsiz tepe marjı ölçümü reddedilir; yalnız güvenilir sonuç Kalman ve takip merkezini günceller.
+6. **Arama penceresi** — Güvenilir ve katı üçlü hizalamalı sonuçta taban pencereye dönülür; düşük güvende `search_window_failure_growth` ile büyür (üst sınır `max_search_window_size`).
+7. **Bilinen başlangıç / kademeli yeniden kazanım** — `initial_position_known=True` iken yalnız ilk başlangıç konumu bilinen sabit kabul edilir ve ilk eşleme doğrudan turuncu ROI içinde yapılır. Sonraki gerçek konumlar algoritmaya verilmez. Güven kaybedilirse turuncu ROI her adımda kademeli büyür; `progressive_global_recovery=True` iken tam-harita moduna ancak ROI zaten haritanın uzun kenarını kaplayacak boyuta ulaştığında geçilir.
 
 ```mermaid
 flowchart LR
@@ -148,12 +149,15 @@ Aşağıdaki gruplar, sık değişen veya anlamı net olmayan alanları listeler
 ### Hareket ve başlangıç
 
 - `initial_row` / `initial_col`, `random_start`, `random_start_middle_band_ratio` — Başlangıç gözlem imleci; rastgele modda merkeze bias’lı örnekleme.
+- `initial_position_known` — `True` iken yalnız ilk başlangıç konumunu referans haritada bilinen öncül olarak kullanır; başlangıçta tam-harita taramasını önler.
 - `step_size`, `initial_heading_degrees`, `rotation_step_degrees`
 - `initial_altitude_agl_m`, `altitude_step_m`, `min_altitude_agl_m`, `max_altitude_agl_m`, `minimum_patch_agl_m`
 
 ### Kamera ve ölçek (irtifa senaryosu)
 
 - `reference_map_gsd_cm_per_px`, `camera_sensor_width_mm`, `camera_focal_length_mm`, `virtual_camera_width_px`
+- DEM'den hesaplanan her yama ölçeği hem gerçek kutu boyutuna hem referansta aranan şablon boyutuna uygulanır. `observation_grid_georef_path=None` varsayılanı gözlem GeoTIFF'inin kendi CRS/transform bilgisini kullanır.
+- Ölçek düzeltmesi geometrik olarak çalışsa da modelin eğitim ölçeğinden çok uzak, çok düşük irtifa örnekleri güvenilir olmayabilir; bu durum geometri/benzersizlik kapısında reddedilir ve yeniden kazanım tetikler.
 
 ### Eşleştirme ve arama
 
@@ -162,13 +166,22 @@ Aşağıdaki gruplar, sık değişen veya anlamı net olmayan alanları listeler
 - `base_search_window_size`, `max_search_window_size`, `search_window_growth_step`, `search_window_failure_growth`
 - `triplet_alignment_tolerance_px` — Üç kutunun “kilit” sayılması için geometrik tolerans
 - `global_refresh_interval` — `0` dışında ise belirli adımlarda tam harita araması
+- `localization_template_std_threshold` — Boş/düşük varyanslı model çıktısını reddeder
+- `localization_peak_margin_threshold` — En iyi ve ikinci bağımsız eşleşme tepesi arasındaki asgari fark
+- `localization_score_threshold`, `localization_confidence_threshold` — Gerçek veriyle kalibre edilen skor ve birleşik güven tabanları; benzersizlik ve üçlü geometri kontrolleri ayrıca zorunludur
+- `localization_require_strict_triplet` — Güvenilir ölçüm için beklenen üçlü geometrisini zorunlu kılar
+- `global_recovery_after_low_confidence_steps` — Ardışık düşük güven sonrası global yeniden kazanım eşiği
+- `global_recovery_min_window_size` — Global yeniden aramadan önce turuncu ROI'nin ulaşması gereken asgari genişlik
+- `progressive_global_recovery` — Tam taramaya ani sıçramayı önler; ROI sınırını gerektiğinde harita boyutuna kadar kademeli büyütür
 
 ### Arayüz
 
 - Mission Control pencere düzeni ekran DPI'ına göre Qt tarafından ölçeklenir.
-- Üst komut alanı Otonom, Kalman, Rota ve Arama Alanı kontrollerini semantik düğmeler olarak sunar.
-- Sol panelde gözlem, model ve eşleşme sekmeleri; sağ panelde navigasyon ve güven telemetrisi bulunur.
-- OpenCV `display_size` değeri yalnızca dahili harita kompozisyon çözünürlüğüdür; pencerenin fiziksel boyutunu sınırlandırmaz.
+- Arayüz, gündüz kullanımına uygun Ground Control Station paleti kullanır: soğuk mavi-gri yüzeyler, havacılık mavisi yöntem vurguları ve durumlara ayrılmış yeşil/amber/kırmızı renkler.
+- Üst komut alanı davranışı değiştiren **İşlem / Yöntem** kontrollerini (Otonom, Kalman, 544/272 girdi, HAM/CLAHE/HISTEQ/EDGE normalizasyonu) yalnızca çizimi değiştiren **Görünüm** kontrollerinden (Rota, Arama Alanı) ayırır.
+- Sol panelde gözlem, model ve eşleşme aynı anda alt alta görünür; aralarındaki yatay ayırıcılarla yükseklikleri değiştirilebilir.
+- Ana panel ayırıcıları sürüklenerek referans harita genişliği serbestçe ayarlanabilir. Harita görüntüsü en-boy oranını korur ve panel oranları sonraki açılış için kaydedilir.
+- OpenCV `display_size` değeri yalnızca dahili kompozisyon çözünürlüğüdür; Mission Control için geniş oranlı `mission_control_canvas_size` kullanılır.
 
 ### Toplu tanılama (diagnostic)
 

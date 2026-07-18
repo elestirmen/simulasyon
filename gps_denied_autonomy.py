@@ -17,6 +17,9 @@ class LocalizationQuality:
     confidence: float
     is_reliable: bool
     reason: str
+    peak_margin_floor: float = 0.0
+    template_std_floor: float = 0.0
+    strict_alignment: bool = True
 
 
 @dataclass(frozen=True)
@@ -112,6 +115,11 @@ def compute_localization_quality(
     score_threshold: float,
     confidence_threshold: float,
     spread_threshold_px: float,
+    peak_margins: Sequence[float] = (),
+    peak_margin_threshold: float = 0.0,
+    template_stddevs: Sequence[float] = (),
+    template_std_threshold: float = 0.0,
+    strict_alignment: Optional[bool] = None,
 ) -> LocalizationQuality:
     normalized_scores = tuple(
         normalize_match_score(score_value, is_sqdiff_method) for score_value in score_values
@@ -154,8 +162,21 @@ def compute_localization_quality(
         ),
     )
 
-    if score_floor < score_threshold:
+    peak_margin_floor = min(peak_margins) if peak_margins else float("inf")
+    template_std_floor = min(template_stddevs) if template_stddevs else float("inf")
+    geometry_ok = True if strict_alignment is None else bool(strict_alignment)
+
+    if template_std_floor < float(template_std_threshold):
+        reason = "template_variance"
+        is_reliable = False
+    elif score_floor < score_threshold:
         reason = "score_floor"
+        is_reliable = False
+    elif not geometry_ok:
+        reason = "geometry"
+        is_reliable = False
+    elif peak_margin_floor < float(peak_margin_threshold):
+        reason = "ambiguity"
         is_reliable = False
     elif center_spread_px > spread_threshold_px:
         reason = "spread"
@@ -175,6 +196,9 @@ def compute_localization_quality(
         confidence=float(confidence),
         is_reliable=is_reliable,
         reason=reason,
+        peak_margin_floor=float(peak_margin_floor),
+        template_std_floor=float(template_std_floor),
+        strict_alignment=geometry_ok,
     )
 
 
