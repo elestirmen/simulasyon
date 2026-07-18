@@ -82,6 +82,14 @@ def build_box_from_center(center: MapPoint, width: int, height: int) -> MapBox:
 
 
 def normalize_match_score(score_value: float, is_sqdiff_method: bool) -> float:
+    """Normalize a template-match score to a quality value in ``[0, 1]``.
+
+    ``TM_CCOEFF_NORMED`` and the other normalized correlation methods already
+    use a meaningful positive-correlation range.  Mapping ``[-1, 1]`` to
+    ``[0, 1]`` made a raw score of ``0`` look like 50% confidence and allowed
+    weak matches to pass the configured floor.  Negative correlation is now
+    treated as zero evidence instead.
+    """
     score_value = float(score_value)
     if is_sqdiff_method:
         if 0.0 <= score_value <= 1.0:
@@ -89,7 +97,7 @@ def normalize_match_score(score_value: float, is_sqdiff_method: bool) -> float:
         return 1.0 / (1.0 + max(0.0, score_value))
 
     if -1.0 <= score_value <= 1.0:
-        return max(0.0, min(1.0, (score_value + 1.0) / 2.0))
+        return max(0.0, min(1.0, score_value))
 
     positive_score = max(0.0, score_value)
     return positive_score / (1.0 + positive_score)

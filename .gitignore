@@ -9,9 +9,26 @@
 !*.py
 !*.md
 !*.txt
+!*.toml
+!*.qml
+!*.qrc
+!*.svg
+!*.ico
+!*.ps1
+!*.cmd
+
+# Yerel kullanici duzeni ve calisma ciktisi repoya girmez.
+ui_layout.json
+diagnostics/
 
 # Uretilmis Python dosyalari her zaman ignore.
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+dist/
+build/
+*.egg-info/

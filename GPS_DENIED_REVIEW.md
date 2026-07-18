@@ -13,7 +13,8 @@ Aşağıdakiler `gps_denied_autonomy.py` içinde tanımlı ve dashboard ana dön
 - **Lokalizasyon kalitesi** (`compute_localization_quality`): normalize skorlar, `score_floor` / `score_mean`, merkez yayılımı (`center_spread_px`), birleşik `confidence` ve `is_reliable` bayrağı (eşikler `localization_*_threshold`).
 - **Düşük güvene bağlı ROI büyütme** (`update_search_window_size`): katı üçlü hizalama sağlandığında pencere tabana döner; aksi halde `search_window_growth_step` / `search_window_failure_growth` ile büyür.
 - **Sensör füzyonu** (`fuse_measurement_with_prior`): takip merkezi ölçüm güvenine göre yumuşatılır; `max_visual_jump_px` eşiğini aşan sıçramalar reddedilir.
-- **Kalman filtresi** (`PositionKalmanFilter`, K tuşu / `kalman_enabled`): sabit-hız modelli 2D konum filtresi; güvenilir ölçümlerde güncellenir.
+- **Kalman filtresi** (`simulation_core.filters.ConstantVelocityKalmanFilter`, K tuşu / `kalman_enabled`): `x, y, vx, vy` durumlu gerçek sabit-hız filtresi; yalnızca güvenilir ölçümlerde güncellenir ve bilinen hareket komutunu kontrol girdisi olarak kullanır.
+- **Korelasyon güven düzeltmesi**: normalize korelasyon yöntemlerinde ham `0.0` artık `%50` olarak yeniden ölçeklenmez. Negatif korelasyon sıfır kanıt sayılır; `localization_score_threshold` doğrudan pozitif korelasyon tabanında anlam kazanır.
 - **Otonom waypoint modu** (`choose_autonomous_action`, `update_waypoint_progress`): P tuşu ile açılır, fare ile harita üzerinde hedef seçilir; gövde-ekseni hizalama, ardışık kabul ve takılma (stuck) kurtarma içerir.
 
 > Not: Üçlü örnekleme hâlâ **diagonal** geometridedir (`get_observation_boxes`); offset vektörü başlık açısıyla döndürülür ama üç pencere eş-doğrusal kalır.
@@ -29,7 +30,7 @@ Dashboard, üçlü şablon kalitesini ölçen bir tanılama modu içerir (`run_t
 ### Mühendislik yorumu
 - Yazılım mühendisi gözüyle: algı (`localize_template_triplet`), kalite/füzyon (`gps_denied_autonomy`) ve görev mantığı (otonom döngü) ayrı katmanlara ayrılmış durumda.
 - İHA mühendisi gözüyle: düşük güvende agresif ilerleme yerine dönüş/yeniden kazanım tercih ediliyor; Kalman açıkken arama çerçevesi filtre konumuna odaklanarak tek-adım hatalarına dayanıklılık artıyor.
-- Bilimsel gözle: her adım CSV'ye (`log_simulasyon_*.csv`) skor, güven, yayılım, ham/Kalman hata (px ve m) olarak yazılır; tanılama vakaları PNG/JSON olarak dışa aktarılır.
+- Bilimsel gözle: her adım CSV'ye (`log_simulasyon_*.csv`) skor, güven, yayılım, ham/Kalman hata (px ve m) ve çekirdek işlem süresi (`islem_ms`) olarak yazılır; tanılama vakaları PNG/JSON olarak dışa aktarılır.
 
 ### Çalıştırma
 - Manuel dashboard: `python simulasyon_yonlendirme_uclu_dashboard.py`

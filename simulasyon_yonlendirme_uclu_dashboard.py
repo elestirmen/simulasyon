@@ -13,24 +13,20 @@ import argparse
 import concurrent.futures
 import csv
 import dataclasses
+import importlib.util
 import json
 import math
 import os
-import queue as _queue
 import random
-import sys as _sys
+import time
 from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
 from typing import IO, List, Optional, Tuple
 
-try:
-    from PyQt5.QtWidgets import QApplication, QMainWindow, QLabel, QSizePolicy
-    from PyQt5.QtCore import Qt, QThread, pyqtSignal
-    from PyQt5.QtGui import QImage, QPixmap
-    _HAS_QT = True
-except ImportError:
-    _HAS_QT = False
+_HAS_QT = bool(
+    importlib.util.find_spec("PySide6") or importlib.util.find_spec("PyQt5")
+)
 
 try:
     from PIL import ImageFont as _PILFont, ImageDraw as _PILDraw, Image as _PILImg
@@ -120,6 +116,11 @@ from gps_denied_autonomy import (
     propagate_center_with_action,
     update_waypoint_progress,
 )
+from simulation_core import (
+    ConstantVelocityKalmanFilter,
+    RasterioGraySource,
+    close_raster_source,
+)
 
 os.environ["OPENCV_IO_MAX_IMAGE_PIXELS"] = str(pow(2, 40))
 
@@ -129,8 +130,6 @@ import rasterio as rio
 from rasterio.enums import Resampling
 from rasterio.warp import reproject
 from pyproj import Transformer
-from tensorflow.keras.layers import Conv2DTranspose
-from tensorflow.keras.models import load_model
 
 UP_KEYS = (ord("w"), ord("W"), 82, 2490368, 65362)
 DOWN_KEYS = (ord("s"), ord("S"), 84, 2621440, 65364)
@@ -238,6 +237,7 @@ class SimulationConfig:
     camera_focal_length_mm: float = 8.8
     virtual_camera_width_px: int = 544
     align_observation_to_reference_grid: bool = True
+    stream_rasters: bool = True
     display_size: Tuple[int, int] = (1000, 1000)
     left_panel_width_ratio: float = 0.20
     right_info_panel_width: int = 180
@@ -367,52 +367,7 @@ class AltitudeSimulationState:
     center_gsd_cm_per_px: float
 
 
-class _CompatConv2DTranspose(Conv2DTranspose):
-    @classmethod
-    def from_config(cls, config):
-        compat_config = dict(config or {})
-        compat_config.pop("groups", None)
-        return super().from_config(compat_config)
-
-
-class PositionKalmanFilter:
-    """Sabit-hız modelli 2D konum Kalman filtresi."""
-
-    def __init__(
-        self,
-        initial_position: Tuple[int, int],
-        process_noise: float = 50.0,
-        measurement_noise: float = 80.0,
-    ) -> None:
-        self._x = float(initial_position[0])
-        self._y = float(initial_position[1])
-        self._var_x = measurement_noise ** 2
-        self._var_y = measurement_noise ** 2
-        self._q = process_noise ** 2
-        self._r = measurement_noise ** 2
-
-    def predict(self, motion_x: float = 0.0, motion_y: float = 0.0) -> None:
-        self._x += motion_x
-        self._y += motion_y
-        self._var_x += self._q
-        self._var_y += self._q
-
-    def update(self, measured_x: float, measured_y: float, confidence: float = 1.0) -> None:
-        r_scaled = self._r / max(0.01, float(confidence))
-        k_x = self._var_x / (self._var_x + r_scaled)
-        k_y = self._var_y / (self._var_y + r_scaled)
-        self._x += k_x * (measured_x - self._x)
-        self._y += k_y * (measured_y - self._y)
-        self._var_x *= max(0.0, 1.0 - k_x)
-        self._var_y *= max(0.0, 1.0 - k_y)
-
-    @property
-    def position(self) -> Tuple[int, int]:
-        return (int(round(self._x)), int(round(self._y)))
-
-    @property
-    def uncertainty_px(self) -> float:
-        return math.sqrt((self._var_x + self._var_y) / 2.0)
+PositionKalmanFilter = ConstantVelocityKalmanFilter
 
 
 # ---------------------------------------------------------------------------
@@ -428,7 +383,7 @@ _CSV_FIELDNAMES = (
     "hata_px", "kalman_hata_px",
     "hata_m", "kalman_hata_m",
     "guven", "skor_min", "skor_ort", "yayilma_px",
-    "guvenilir", "guvenilirlik_neden", "arama_pencere_px",
+    "guvenilir", "guvenilirlik_neden", "arama_pencere_px", "islem_ms",
 )
 
 
@@ -497,6 +452,7 @@ def _write_csv_row(
     actual_center_ref: Tuple[int, int],
     quality: "LocalizationQuality",
     search_window_size: int,
+    processing_ms: float,
 ) -> None:
     kalman_x = kalman_center[0] if kalman_center is not None else ""
     kalman_y = kalman_center[1] if kalman_center is not None else ""
@@ -550,6 +506,7 @@ def _write_csv_row(
         "guvenilir": int(quality.is_reliable),
         "guvenilirlik_neden": quality.reason,
         "arama_pencere_px": search_window_size,
+        "islem_ms": round(float(processing_ms), 2),
     })
 
 
@@ -574,6 +531,10 @@ def _parse_args() -> argparse.Namespace:
                         help="Hareket adım büyüklüğü (piksel)")
     parser.add_argument("--arama-penceresi", type=int, default=None, metavar="N",
                         help="Başlangıç arama penceresi (piksel)")
+    parser.add_argument("--raster-stream", dest="stream_rasters", action="store_true", default=None,
+                        help="GeoTIFF dosyalarını düşük bellekli pencere erişimiyle kullan")
+    parser.add_argument("--raster-bellek", dest="stream_rasters", action="store_false",
+                        help="GeoTIFF dosyalarını eski davranışla tamamen belleğe al")
     parser.add_argument("--kalman", action="store_true", default=None,
                         help="Kalman filtresini aktif et")
     parser.add_argument("--kalman-yok", dest="kalman", action="store_false",
@@ -608,6 +569,8 @@ def _apply_args_to_config(
         overrides["step_size"] = args.adim_px
     if args.arama_penceresi is not None:
         overrides["base_search_window_size"] = args.arama_penceresi
+    if args.stream_rasters is not None:
+        overrides["stream_rasters"] = args.stream_rasters
     if args.kalman is not None:
         overrides["kalman_enabled"] = args.kalman
     if args.csv_yok:
@@ -808,6 +771,19 @@ def resolve_config_paths(config: SimulationConfig) -> SimulationConfig:
 
 
 def load_model_compat(model_path: Path):
+    # TensorFlow is intentionally imported only when the worker actually loads
+    # the model.  CLI help and the native window can therefore appear without
+    # paying TensorFlow's multi-second import cost.
+    from tensorflow.keras.layers import Conv2DTranspose
+    from tensorflow.keras.models import load_model
+
+    class CompatConv2DTranspose(Conv2DTranspose):
+        @classmethod
+        def from_config(cls, layer_config):
+            compat_config = dict(layer_config or {})
+            compat_config.pop("groups", None)
+            return super().from_config(compat_config)
+
     try:
         return load_model(str(model_path), compile=False)
     except TypeError as exc:
@@ -815,7 +791,7 @@ def load_model_compat(model_path: Path):
             return load_model(
                 str(model_path),
                 compile=False,
-                custom_objects={"Conv2DTranspose": _CompatConv2DTranspose},
+                custom_objects={"Conv2DTranspose": CompatConv2DTranspose},
             )
         raise
 
@@ -1868,37 +1844,79 @@ def apply_runtime_ui_hotkey(key: int, ui_state: dict) -> bool:
     return True
 
 
-def load_assets(config: SimulationConfig) -> Tuple[np.ndarray, np.ndarray, object]:
+def load_assets(
+    config: SimulationConfig,
+    status_callback=None,
+) -> Tuple[object, object, object]:
     validate_config(config)
     reference_map_path = resolve_map_path(config.reference_map_path)
-    if is_georaster_path(reference_map_path):
-        reference_map = load_grayscale_raster(reference_map_path)
-    else:
-        reference_map = load_grayscale_image(reference_map_path)
-
-    if (
-        config.align_observation_to_reference_grid
-        and is_georaster_path(reference_map_path)
-        and is_georaster_path(config.observation_map_path)
-    ):
-        observation_map = load_observation_aligned_to_reference_grid(
-            config.observation_map_path,
-            reference_map_path,
+    reference_map = None
+    observation_map = None
+    try:
+        if status_callback is not None:
+            status_callback("Referans harita hazırlanıyor", "loading")
+        use_streaming = (
+            config.stream_rasters
+            and is_georaster_path(reference_map_path)
+            and is_georaster_path(config.observation_map_path)
         )
-    elif is_georaster_path(config.observation_map_path):
-        observation_map = load_grayscale_raster(config.observation_map_path)
-    else:
-        observation_map = load_grayscale_image(config.observation_map_path)
+        if use_streaming:
+            reference_map = RasterioGraySource(reference_map_path)
+            observation_map = RasterioGraySource(
+                config.observation_map_path,
+                reference_dataset=(
+                    reference_map.dataset
+                    if config.align_observation_to_reference_grid
+                    else None
+                ),
+            )
+            if observation_map.shape != reference_map.shape:
+                # Non-aligned streaming sources cannot be resized lazily. Keep
+                # the legacy behavior explicit for this uncommon configuration.
+                close_raster_source(observation_map)
+                observation_map = load_grayscale_raster(config.observation_map_path)
+                observation_map = cv2.resize(
+                    observation_map,
+                    (reference_map.shape[1], reference_map.shape[0]),
+                    interpolation=cv2.INTER_LINEAR,
+                )
+        else:
+            if is_georaster_path(reference_map_path):
+                reference_map = load_grayscale_raster(reference_map_path)
+            else:
+                reference_map = load_grayscale_image(reference_map_path)
 
-    if observation_map.shape != reference_map.shape:
-        observation_map = cv2.resize(
-            observation_map,
-            (reference_map.shape[1], reference_map.shape[0]),
-            interpolation=cv2.INTER_LINEAR,
-        )
+            if (
+                config.align_observation_to_reference_grid
+                and is_georaster_path(reference_map_path)
+                and is_georaster_path(config.observation_map_path)
+            ):
+                observation_map = load_observation_aligned_to_reference_grid(
+                    config.observation_map_path,
+                    reference_map_path,
+                )
+            elif is_georaster_path(config.observation_map_path):
+                observation_map = load_grayscale_raster(config.observation_map_path)
+            else:
+                observation_map = load_grayscale_image(config.observation_map_path)
 
-    model = load_model_compat(resolve_model_path(config.model_path))
-    return reference_map, observation_map, model
+            if observation_map.shape != reference_map.shape:
+                observation_map = cv2.resize(
+                    observation_map,
+                    (reference_map.shape[1], reference_map.shape[0]),
+                    interpolation=cv2.INTER_LINEAR,
+                )
+
+        if status_callback is not None:
+            status_callback("Yapay zekâ modeli yükleniyor", "loading")
+        model = load_model_compat(resolve_model_path(config.model_path))
+        if status_callback is not None:
+            status_callback("Simülasyon hazır", "ready")
+        return reference_map, observation_map, model
+    except Exception:
+        close_raster_source(observation_map)
+        close_raster_source(reference_map)
+        raise
 
 
 def clamp_observation_cursor(
@@ -2139,6 +2157,7 @@ def extract_template_triplet(
     for box, scale_factor in zip(
         observation_boxes,
         altitude_state.patch_scale_factors,
+        strict=True,
     ):
         observation_windows.append(
             extract_rotated_observation_window(
@@ -2359,7 +2378,9 @@ def extract_search_region(
     )
     if force_global:
         full_box = (0, 0, reference_map.shape[1], reference_map.shape[0])
-        return reference_map, (0, 0), full_box, "global"
+        materialize = getattr(reference_map, "read_full", None)
+        full_map = materialize() if callable(materialize) else reference_map
+        return full_map, (0, 0), full_box, "global"
 
     search_box = get_search_window_box(
         reference_map.shape,
@@ -2401,7 +2422,11 @@ def localize_template_triplet(
 
     match_results, match_backend = match_three(search_region, templates, config)
 
-    for (orig_w, orig_h), match_result in zip(orig_template_sizes, match_results):
+    for (orig_w, orig_h), match_result in zip(
+        orig_template_sizes,
+        match_results,
+        strict=True,
+    ):
         score, local_top_left = match_result
         scores.append(score)
         matched_boxes.append(
@@ -4280,12 +4305,19 @@ def main(
     _getkey_fn=None,
     _use_qt: bool = False,
     _ctx_holder=None,
+    _telemetry_fn=None,
+    _status_fn=None,
 ) -> None:
+    def emit_status(message: str, level: str = "info") -> None:
+        if _status_fn is not None:
+            _status_fn(message, level)
+
     if config is None:
         config = SimulationConfig()
         config = _apply_args_to_config(config, _parse_args())
+    emit_status("Veri yolları doğrulanıyor", "loading")
     config = resolve_config_paths(config)
-    reference_map, observation_map, model = load_assets(config)
+    reference_map, observation_map, model = load_assets(config, emit_status)
     terrain_context: Optional[TerrainContext] = None
 
     try:
@@ -4351,6 +4383,7 @@ def main(
                 )
 
             while True:
+                step_started_at = time.perf_counter()
                 current_search_window_size = search_window_size
                 runtime_obs_window_size = int(
                     runtime_ui_state.get("obs_window_size", config.sample_window_size)
@@ -4568,12 +4601,13 @@ def main(
                     search_mode, match_backend, current_search_window_size, config,
                 )
 
+                processing_ms = (time.perf_counter() - step_started_at) * 1000.0
                 if csv_writer is not None:
                     _write_csv_row(
                         csv_writer, step_count, row, col, heading_degrees, altitude_state,
                         last_action, score_values, intersection_mode, search_mode, match_backend,
                         actual_center, raw_predicted_center, kalman_center, actual_center,
-                        quality, current_search_window_size,
+                        quality, current_search_window_size, processing_ms,
                     )
 
                 # Tekrar kullanılacak dashboard kwargs
@@ -4613,6 +4647,35 @@ def main(
                     right_panel_rect=right_panel_rect,
                 )
                 dashboard = draw_localization_dashboard(**_dash_kw)
+                runtime_ui_context.update(
+                    map_rect=map_rect,
+                    observation_view=observation_view,
+                    template_strip=template_strip,
+                    ref_patch_image=ref_patch_image,
+                )
+                if _telemetry_fn is not None:
+                    _telemetry_fn(
+                        {
+                            "step": step_count,
+                            "heading": get_heading_label(heading_degrees),
+                            "altitude_m": altitude_state.altitude_agl_m,
+                            "gsd_cm": altitude_state.center_gsd_cm_per_px,
+                            "error_px": error_pixels,
+                            "error_m": error_pixels * config.reference_map_gsd_cm_per_px / 100.0,
+                            "confidence": quality.confidence,
+                            "reliable": quality.is_reliable,
+                            "reason": quality.reason,
+                            "scores": tuple(float(score) for score in score_values),
+                            "intersection_mode": intersection_mode,
+                            "search_mode": search_mode,
+                            "search_window_px": current_search_window_size,
+                            "backend": match_backend,
+                            "action": get_action_label(last_action),
+                            "kalman_on": use_kalman,
+                            "autonomous": autonomous_mode,
+                            "processing_ms": processing_ms,
+                        }
+                    )
 
                 # --- İç döngü: tuş bekleme / otonom adım ---
                 should_exit = False
@@ -4647,6 +4710,7 @@ def main(
                             reference_preview_state = create_reference_preview_state(
                                 reference_map, map_rect, reference_viewport_box, config,
                             )
+                            runtime_ui_context["map_rect"] = map_rect
                             runtime_ui_context["reference_preview_state"] = reference_preview_state
                             _dash_kw["observation_rect"] = observation_rect
                             _dash_kw["template_rect"] = template_rect
@@ -4792,165 +4856,31 @@ def main(
 
     finally:
         close_terrain_context(terrain_context)
+        close_raster_source(observation_map)
+        close_raster_source(reference_map)
         if not _use_qt:
             cv2.destroyAllWindows()
 
 
-# ---------------------------------------------------------------------------
-# PyQt5 UI classes
-# ---------------------------------------------------------------------------
-
-if _HAS_QT:
-    class DashboardLabel(QLabel):
-        mouse_pressed = pyqtSignal(int, int)
-        mouse_moved = pyqtSignal(int, int)
-
-        def __init__(self, parent=None):
-            super().__init__(parent)
-            self.setAlignment(Qt.AlignCenter)
-            self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-            self.setMinimumSize(400, 400)
-            self.setStyleSheet("background: black;")
-            self._orig_pixmap = None
-            self._img_w = 1
-            self._img_h = 1
-
-        def set_frame(self, bgr_array: np.ndarray) -> None:
-            h, w = bgr_array.shape[:2]
-            self._img_w = w
-            self._img_h = h
-            rgb = cv2.cvtColor(bgr_array, cv2.COLOR_BGR2RGB)
-            q_img = QImage(rgb.data, w, h, w * 3, QImage.Format_RGB888).copy()
-            self._orig_pixmap = QPixmap.fromImage(q_img)
-            self._refresh()
-
-        def _refresh(self) -> None:
-            if self._orig_pixmap is not None:
-                self.setPixmap(
-                    self._orig_pixmap.scaled(
-                        self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation,
-                    )
-                )
-
-        def resizeEvent(self, event):
-            super().resizeEvent(event)
-            self._refresh()
-
-        def _to_image_coords(self, wx: int, wy: int):
-            pm = self.pixmap()
-            if pm is None or pm.isNull():
-                return wx, wy
-            pw, ph = pm.width(), pm.height()
-            if pw <= 0 or ph <= 0:
-                return wx, wy
-            x_off = (self.width() - pw) // 2
-            y_off = (self.height() - ph) // 2
-            ix = int((wx - x_off) * self._img_w / pw)
-            iy = int((wy - y_off) * self._img_h / ph)
-            return ix, iy
-
-        def mousePressEvent(self, event):
-            ix, iy = self._to_image_coords(event.x(), event.y())
-            self.mouse_pressed.emit(ix, iy)
-
-        def mouseMoveEvent(self, event):
-            ix, iy = self._to_image_coords(event.x(), event.y())
-            self.mouse_moved.emit(ix, iy)
-
-    class SimulationWorker(QThread):
-        frame_ready = pyqtSignal(object)
-
-        def __init__(self, config=None):
-            super().__init__()
-            self._config = config
-            self._key_q: _queue.Queue = _queue.Queue()
-            self._ctx_holder = [None]
-
-        def post_key(self, cv2_key: int) -> None:
-            self._key_q.put(cv2_key)
-
-        def _display_fn(self, image: np.ndarray, lb_state: dict) -> None:
-            lb_state.update(scale=1.0, x_off=0, y_off=0)
-            self.frame_ready.emit(image.copy())
-
-        def _getkey_fn(self, wait_ms: int) -> int:
-            try:
-                return self._key_q.get(timeout=wait_ms / 1000.0)
-            except _queue.Empty:
-                return -1
-
-        def run(self) -> None:
-            main(
-                config=self._config,
-                _display_fn=self._display_fn,
-                _getkey_fn=self._getkey_fn,
-                _use_qt=True,
-                _ctx_holder=self._ctx_holder,
-            )
-
-    class SimulationWindow(QMainWindow):
-        def __init__(self, config=None):
-            super().__init__()
-            self._config = config
-            self._worker = SimulationWorker(config)
-            w = config.display_size[0] if config else 1000
-            h = config.display_size[1] if config else 1000
-            self.setWindowTitle("GPS-Denied Lokalizasyon Simülasyonu")
-            self.resize(w, h)
-            self._label = DashboardLabel()
-            self.setCentralWidget(self._label)
-            self._worker.frame_ready.connect(self._label.set_frame)
-            self._label.mouse_pressed.connect(self._on_press)
-            self._label.mouse_moved.connect(self._on_move)
-
-        def _ctx(self):
-            return self._worker._ctx_holder[0]
-
-        def _on_press(self, x: int, y: int) -> None:
-            ctx = self._ctx()
-            if ctx is not None:
-                _runtime_buttons_mouse_cb(cv2.EVENT_LBUTTONDOWN, x, y, 0, ctx)
-
-        def _on_move(self, x: int, y: int) -> None:
-            ctx = self._ctx()
-            if ctx is not None:
-                _runtime_buttons_mouse_cb(cv2.EVENT_MOUSEMOVE, x, y, 0, ctx)
-
-        def keyPressEvent(self, event) -> None:
-            qt_key = event.key()
-            cv2_key = _QT_KEY_MAP.get(qt_key)
-            if cv2_key is None:
-                text = event.text()
-                if text and len(text) == 1 and 32 <= ord(text) < 128:
-                    cv2_key = ord(text)
-                else:
-                    cv2_key = qt_key
-            self._worker.post_key(cv2_key)
-
-        def showEvent(self, event) -> None:
-            super().showEvent(event)
-            if not self._worker.isRunning():
-                self._worker.start()
-
-        def closeEvent(self, event) -> None:
-            self._worker.post_key(27)
-            self._worker.wait(4000)
-            event.accept()
-
-
 def main_qt(config=None) -> None:
     if not _HAS_QT:
-        print("PyQt5 bulunamadı, OpenCV moduna geçiliyor.")
+        print("PySide6/PyQt5 bulunamadı, OpenCV moduna geçiliyor.")
         main(config=config)
         return
-    app = QApplication.instance() or QApplication(_sys.argv)
     if config is None:
         config = SimulationConfig()
         config = _apply_args_to_config(config, _parse_args())
     config = resolve_config_paths(config)
-    win = SimulationWindow(config=config)
-    win.show()
-    _sys.exit(app.exec_())
+    from mission_control_ui import run_mission_control
+
+    raise SystemExit(
+        run_mission_control(
+            config,
+            main,
+            _runtime_buttons_mouse_cb,
+            _QT_KEY_MAP,
+        )
+    )
 
 
 if __name__ == "__main__":

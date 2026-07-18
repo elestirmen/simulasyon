@@ -2,7 +2,15 @@
 
 Bu depo, İHA’nın **gözlem haritasından** üç komşu bölgeden alınan görüntüleri (üçlü şablon) bir **derin öğrenme modelinden** geçirip, çıktıları **referans haritada** OpenCV şablon eşleştirmesi ile arayarak konum tahmini sürecini simüle eder. Tahmin, üç eşleşme kutusunun kesişiminden veya geometrik tutarlılık modlarından türetilir; arama bölgesi (ROI) önceki tahmine göre uyarlanır veya tüm haritaya genişler.
 
-Ana uygulama `simulasyon_yonlendirme_uclu_dashboard.py`: sol tarafta gözlem ve model çıktıları, sağda referans harita önizlemesi ve HUD ile tek bir pencerede çalışır. Varsayılan giriş noktası **PyQt5** penceresidir (`main_qt`); PyQt5 kurulu değilse otomatik olarak OpenCV penceresine (`main`) düşer.
+Ana uygulama `simulasyon_yonlendirme_uclu_dashboard.py` artık **GPS-Denied Mission Control** arayüzünü açar. PySide6 tabanlı pencere; gerçek Qt kontrolleri, erişilebilir telemetri kartları, görsel kanıt sekmeleri, yükleme durumu ve merkezi operasyon haritası sunar. PySide6 bulunamazsa PyQt5 uyumluluk katmanı, iki Qt bağlayıcısı da bulunamazsa OpenCV arayüzü kullanılır.
+
+2026 yenilemesinin öne çıkanları:
+
+- GeoTIFF dosyaları varsayılan olarak Rasterio pencere erişimi ve `WarpedVRT` ile kullanılır; çok GB boyutlu rasterler başlangıçta tamamen RAM'e alınmaz.
+- TensorFlow yalnızca model gerçekten yükleneceğinde import edilir; komut satırı ve pencere hızlı açılır.
+- Kalman filtresi gerçek dört durumlu `x, y, vx, vy` sabit-hız modelidir.
+- Normalize korelasyon skoru artık sıfırı `%50 güven` olarak yorumlamaz; negatif korelasyon sıfır kanıt kabul edilir.
+- Her adımın çekirdek işlem süresi CSV'deki `islem_ms` alanına ve Mission Control alt durum çubuğuna yazılır.
 
 ---
 
@@ -10,7 +18,11 @@ Ana uygulama `simulasyon_yonlendirme_uclu_dashboard.py`: sol tarafta gözlem ve 
 
 | Dosya | Rol |
 |--------|-----|
-| `simulasyon_yonlendirme_uclu_dashboard.py` | Ana simülasyon, dashboard, şablon eşleştirme ve isteğe bağlı tanılama toplu çalıştırması |
+| `simulasyon_yonlendirme_uclu_dashboard.py` | Simülasyon motoru, şablon eşleştirme ve isteğe bağlı OpenCV çizim katmanı |
+| `mission_control_ui.py` | Semantik PySide6/PyQt5 Mission Control arayüzü |
+| `simulation_core/filters.py` | Dört durumlu sabit-hız Kalman filtresi |
+| `simulation_core/raster_source.py` | Düşük bellekli, pencere tabanlı GeoTIFF erişimi ve grid hizalama |
+| `tests/` | Kalite, filtre, raster ve hızlı CLI regresyon testleri |
 | `gps_denied_autonomy.py` | Lokalizasyon kalitesi, sensör füzyonu, waypoint ilerlemesi ve otonom hareket seçimi için yardımcı modül (dashboard tarafından **import edilir** ve aktif kullanılır) |
 | `simulasyon_yonlendirme_model_okuma.py` | Model okuma / ilgili deney akışı |
 | `simulasyon_yonlendirme.py`, `simulasyon_yonlendirme_uclu.py` | Daha eski veya sadeleştirilmiş yönlendirme denemeleri |
@@ -28,13 +40,14 @@ Ana uygulama `simulasyon_yonlendirme_uclu_dashboard.py`: sol tarafta gözlem ve 
 - **Rasterio** — `.tif` / GeoTIFF okuma; gözlemi referans ızgarasına hizalama
 - **pyproj** — koordinat dönüşümleri (irtifa / DEM ile arazi örneklemesi)
 - **TensorFlow 2 + Keras** — `.h5` model yükleme; eski modeller için `Conv2DTranspose` uyumluluk sınıfı kullanılır
-- **PyQt5** *(isteğe bağlı)* — Varsayılan pencere arayüzü; kurulu değilse OpenCV penceresine düşülür
+- **PySide6** — Önerilen ve varsayılan Mission Control arayüzü
+- **PyQt5** *(isteğe bağlı uyumluluk)* — PySide6 yoksa kullanılabilir
 - **Pillow** *(isteğe bağlı)* — HUD’da Türkçe karakterlerin doğru render edilmesi için; yoksa ASCII’ye sadeleştirilir
 
 Örnek kurulum:
 
 ```bash
-pip install opencv-python numpy rasterio pyproj tensorflow PyQt5 Pillow
+pip install -e ".[dev]"
 ```
 
 GPU isteğe bağlıdır; CPU ile de çalışır, model çıkarımı daha yavaş olur. Çok büyük rasterler için `OPENCV_IO_MAX_IMAGE_PIXELS` betik içinde yükseltilmiştir.
@@ -59,7 +72,7 @@ Tüm yollar `SimulationConfig` içinde `pathlib.Path` olarak tanımlıdır; kend
 - `"normal"` veya `"standart"` — Sabit ölçek / irtifa varsayımı; DEM yüklenmez.
 - `"irtifa"` / `"altitude"` / `"elevation"` — Sanal kamera GSD’si, yama ölçekleri ve zemin kotu için DEM + gözlem rasteri kullanılır.
 
-Gözlem piksel boyutu referanstan farklıysa `load_assets` gözlemi referans boyutuna **yeniden örnekler**.
+`stream_rasters=True` iken referans ve gözlem dosyaları pencere bazlı okunur. Gözlem grid'i farklıysa `WarpedVRT`, yalnızca istenen pencereyi referans grid'ine yeniden örnekler. Eski tam-bellek davranışı karşılaştırma amacıyla `--raster-bellek` ile seçilebilir.
 
 ---
 
@@ -69,6 +82,12 @@ Proje kökünden (veya veri dosyalarının göreli yolların doğru çözüldü�
 
 ```bash
 python simulasyon_yonlendirme_uclu_dashboard.py
+```
+
+Windows'ta çift tıklanabilir başlatıcı:
+
+```text
+run_mission_control.cmd
 ```
 
 Tüm varsayılanlar `SimulationConfig` dataclass içindedir; ayrıca sık değişen birkaç parametre **komut satırı argümanıyla** geçersiz kılınabilir:
@@ -81,6 +100,7 @@ Tüm varsayılanlar `SimulationConfig` dataclass içindedir; ayrıca sık deği�
 | `--model YOL` | `model_path` (dosya veya klasör) |
 | `--adim-px N` | `step_size` |
 | `--arama-penceresi N` | `base_search_window_size` |
+| `--raster-stream` / `--raster-bellek` | Pencere bazlı veya tam-bellek raster erişimi |
 | `--kalman` / `--kalman-yok` | `kalman_enabled` |
 | `--csv-yok` | `log_csv_enabled=False` |
 | `--csv-dosya YOL` | `log_csv_path` |
@@ -145,9 +165,10 @@ Aşağıdaki gruplar, sık değişen veya anlamı net olmayan alanları listeler
 
 ### Arayüz
 
-- `display_size`, `left_panel_width_ratio`, panel renkleri, `path_history_limit`
-- `ui_buttons_enabled` — Fare ile üst kısayol düğmeleri
-- `show_*` bayrakları — Bilgi paneli, trajektori, ROI çerçevesi, TM kutuları, yön oku, gözlem kutuları
+- Mission Control pencere düzeni ekran DPI'ına göre Qt tarafından ölçeklenir.
+- Üst komut alanı Otonom, Kalman, Rota ve Arama Alanı kontrollerini semantik düğmeler olarak sunar.
+- Sol panelde gözlem, model ve eşleşme sekmeleri; sağ panelde navigasyon ve güven telemetrisi bulunur.
+- OpenCV `display_size` değeri yalnızca dahili harita kompozisyon çözünürlüğüdür; pencerenin fiziksel boyutunu sınırlandırmaz.
 
 ### Toplu tanılama (diagnostic)
 
@@ -219,3 +240,22 @@ Depo `.gitignore` ile çoğu dosyayı dışarıda bırakır; yalnızca seçili u
 `GPS_DENIED_REVIEW.md` — GPS’siz otonomi ve güven skorları üzerine metinsel inceleme.
 
 `gps_denied_autonomy.py` — Görev waypoint’leri, güvenilirlik ve otonom aksiyon seçimi gibi yapılar içerir; yeni bir otonom katmanı veya ayrı bir deney betiği yazarken başlangıç noktası olarak kullanılabilir.
+
+---
+
+## Test, kalite ve Windows paketi
+
+Çekirdek regresyon paketi:
+
+```bash
+pytest
+ruff check gps_denied_autonomy.py simulation_core mission_control_ui.py simulasyon_yonlendirme_uclu_dashboard.py tests
+```
+
+PySide6'nın resmi dağıtım aracı kurulu bir sanal ortamda Windows paketi oluşturmak için:
+
+```text
+build_windows.cmd
+```
+
+Komutu yalnız görmek için `build_windows.cmd -DryRun` kullanılabilir. Harita, DEM ve model gibi büyük çalışma verileri uygulama paketine gömülmez; kullanıcı tarafından seçilen/verilen veri klasöründe tutulur.
