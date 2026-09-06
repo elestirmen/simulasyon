@@ -36,7 +36,7 @@ py-modules = [
 ]
 
 [tool.setuptools.packages.find]
-include = ["simulation_core*"]
+include = ["simulation_core*", "mission_ui*"]
 
 [tool.pytest.ini_options]
 addopts = "-q"

@@ -51,63 +51,7 @@ except ImportError:  # pragma: no cover - compatibility fallback
     QT_BINDING = "PyQt5"
 
 
-APP_STYLE = """
-QMainWindow, QWidget#Root {
-    background: #DCE4EB;
-    color: #183247;
-    font-family: "Segoe UI Variable", "Segoe UI";
-    font-size: 13px;
-}
-QFrame#Header, QFrame#Footer, QFrame#SidePanel, QFrame#MapPanel {
-    background: #F4F7FA;
-    border: 1px solid #AEBECC;
-    border-radius: 12px;
-}
-QFrame#Header { border-bottom: 3px solid #2A789E; }
-QLabel#AppTitle { font-size: 18px; font-weight: 700; color: #102E45; }
-QLabel#Muted { color: #607589; }
-QLabel#SectionTitle { font-size: 12px; font-weight: 700; color: #36566F; }
-QLabel#ControlGroupLabel {
-    color: #547087; font-size: 9px; font-weight: 800; letter-spacing: 1px;
-}
-QLabel#StatusPill {
-    background: #D9EFE6; color: #146047; border: 1px solid #83BCA6;
-    border-radius: 10px; padding: 5px 10px; font-weight: 700;
-}
-QPushButton {
-    background: #E8EEF3; color: #234258; border: 1px solid #AFC0CE;
-    border-radius: 8px; padding: 8px 12px; font-weight: 600;
-}
-QPushButton:hover { background: #DCE8F0; border-color: #6F96B2; }
-QPushButton:pressed { background: #C8DCE9; }
-QPushButton[controlRole="method"] { border-color: #7BA9C3; }
-QPushButton[controlRole="method"]:checked {
-    background: #176B91; border-color: #145D7E; color: #FFFFFF;
-}
-QPushButton[controlRole="visual"] { color: #2D4B61; }
-QPushButton[controlRole="visual"]:checked {
-    background: #D7E4ED; border-color: #7C9CAF; color: #25475E;
-}
-QFrame#ControlGroup {
-    background: #EAF0F4; border: 1px solid #C1CDD6; border-radius: 9px;
-}
-QFrame#EvidenceCard {
-    background: #EDF2F5; border: 1px solid #C3CFD8; border-radius: 9px;
-}
-QProgressBar {
-    background: #D4DFE7; border: 1px solid #B5C4CF; border-radius: 6px;
-    color: #234258; text-align: center; min-height: 12px;
-}
-QProgressBar::chunk { background: #1886A5; border-radius: 5px; }
-QSplitter::handle { background: #A8BAC7; }
-QSplitter::handle:horizontal { width: 8px; margin: 6px 2px; }
-QSplitter::handle:vertical { height: 8px; margin: 2px 6px; }
-QSplitter::handle:hover { background: #2787A9; }
-QToolTip {
-    background: #F7FAFC; color: #183247; border: 1px solid #8EA5B6;
-    padding: 5px;
-}
-"""
+from mission_ui import APP_STYLE, MetricCard, create_footer, create_header, set_status
 
 
 def _as_bgr(image: Optional[np.ndarray]) -> Optional[np.ndarray]:
@@ -124,10 +68,7 @@ class ImagePane(QLabel):
         self.setAlignment(Qt.AlignCenter)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setMinimumSize(160, 100)
-        self.setStyleSheet(
-            "background:#C9D4DC; border:1px solid #98AAB8; "
-            "border-radius:9px; color:#4F6678;"
-        )
+        self.setObjectName("ImageWell")
         self._pixmap_source: Optional[QPixmap] = None
 
     def set_frame(self, frame: Optional[np.ndarray]) -> None:
@@ -199,24 +140,6 @@ class MapCanvas(ImagePane):
         source_x, source_y = self._to_source(x, y)
         self.source_moved.emit(source_x, source_y)
         super().mouseMoveEvent(event)
-
-
-class MetricCard(QFrame):
-    def __init__(self, title: str, initial: str = "—", parent=None) -> None:
-        super().__init__(parent)
-        self.setStyleSheet(
-            "QFrame{background:#E8EEF2;border:1px solid #C5D0D8;border-radius:9px;}"
-        )
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(11, 9, 11, 9)
-        layout.setSpacing(2)
-        label = QLabel(title.upper())
-        label.setStyleSheet("color:#597084;font-size:10px;font-weight:700;border:0;")
-        self.value = QLabel(initial)
-        self.value.setStyleSheet("color:#102E45;font-size:18px;font-weight:700;border:0;")
-        self.value.setAccessibleName(title)
-        layout.addWidget(label)
-        layout.addWidget(self.value)
 
 
 class SimulationWorker(QThread):
@@ -295,7 +218,7 @@ class MissionControlWindow(QMainWindow):
             "KapadokyaUniversity", "GPSDeniedMissionControl"
         )
 
-        self.setWindowTitle("GPS-Denied Mission Control")
+        self.setWindowTitle("Mission Control | Visual")
         self.setMinimumSize(1180, 760)
         self.resize(1480, 920)
         self.setStyleSheet(APP_STYLE)
@@ -317,39 +240,10 @@ class MissionControlWindow(QMainWindow):
         root_layout.setSpacing(10)
         self.setCentralWidget(root)
 
-        header = QFrame()
-        header.setObjectName("Header")
-        header_layout = QVBoxLayout(header)
-        header_layout.setContentsMargins(16, 11, 14, 11)
-        header_layout.setSpacing(7)
-        identity_row = QHBoxLayout()
-        identity_row.setSpacing(10)
-        brand = QLabel("◈")
-        brand.setStyleSheet("font-size:26px;color:#1682A3;")
-        title_box = QVBoxLayout()
-        title_box.setSpacing(0)
-        title = QLabel("GPS-Denied Mission Control")
-        title.setObjectName("AppTitle")
-        subtitle = QLabel("Görsel lokalizasyon ve otonom görev konsolu")
-        subtitle.setObjectName("Muted")
-        title_box.addWidget(title)
-        title_box.addWidget(subtitle)
-        identity_row.addWidget(brand)
-        identity_row.addLayout(title_box)
-        identity_row.addStretch(1)
-
-        scenario = QLabel(str(self._config.scenario_mode).upper())
-        scenario.setStyleSheet(
-            "background:#DFEAF2;color:#234F6B;border:1px solid #ABC1D0;"
-            "border-radius:10px;padding:5px 10px;font-weight:700;"
+        header, header_layout, self.status_pill = create_header(
+            "VISUAL", "Görsel konumlama  /  GPS bağımsız navigasyon"
         )
-        scenario.setAccessibleName("Aktif senaryo")
-        self.status_pill = QLabel("BAŞLATILIYOR")
-        self.status_pill.setObjectName("StatusPill")
-        self.status_pill.setAccessibleName("Lokalizasyon durumu")
-        identity_row.addWidget(scenario)
-        identity_row.addWidget(self.status_pill)
-        header_layout.addLayout(identity_row)
+        set_status(self.status_pill, "BAŞLATILIYOR")
 
         method_group = QFrame()
         method_group.setObjectName("ControlGroup")
@@ -525,6 +419,7 @@ class MissionControlWindow(QMainWindow):
         self.detail_label.setObjectName("Muted")
         self.detail_label.setAccessibleName("Lokalizasyon ayrıntıları")
         right_layout.addWidget(self.detail_label)
+        self.detail_label.setMargin(10)
         right_layout.addStretch(1)
 
         self.main_splitter.addWidget(left_panel)
@@ -542,21 +437,11 @@ class MissionControlWindow(QMainWindow):
             self.evidence_splitter.restoreState(saved_evidence_splitter)
         root_layout.addWidget(self.main_splitter, 1)
 
-        footer = QFrame()
-        footer.setObjectName("Footer")
-        footer_layout = QHBoxLayout(footer)
-        footer_layout.setContentsMargins(13, 7, 13, 7)
-        shortcuts = QLabel(
-            "Ayırıcıları sürükleyerek panel boyutlarını ayarlayın  •  "
-            "WASD hareket  •  Q/E dönüş  •  N normalizasyon  •  V 544/272  •  ESC çıkış"
+        footer, self.performance_label = create_footer(
+            "W A S D  hareket    ·    Q / E  dönüş    ·    N  normalizasyon    ·    "
+            "V  çözünürlük    ·    ESC  çıkış    |    Panel sınırlarını sürükleyin"
         )
-        shortcuts.setObjectName("Muted")
-        self.performance_label = QLabel(f"{QT_BINDING} • bekleniyor")
-        self.performance_label.setObjectName("Muted")
         self.performance_label.setAccessibleName("İşleme performansı")
-        footer_layout.addWidget(shortcuts)
-        footer_layout.addStretch(1)
-        footer_layout.addWidget(self.performance_label)
         root_layout.addWidget(footer)
 
     @staticmethod
@@ -610,18 +495,11 @@ class MissionControlWindow(QMainWindow):
         confidence = max(0, min(100, int(round(float(data.get("confidence", 0.0)) * 100))))
         self.confidence_bar.setValue(confidence)
         reliable = bool(data.get("reliable"))
-        if reliable:
-            self.status_pill.setText("KİLİT SAĞLAM")
-            self.status_pill.setStyleSheet(
-                "background:#D9EFE6;color:#146047;border:1px solid #83BCA6;"
-                "border-radius:10px;padding:5px 10px;font-weight:700;"
-            )
-        else:
-            self.status_pill.setText("YENİDEN KAZANIM")
-            self.status_pill.setStyleSheet(
-                "background:#F7E8C8;color:#755019;border:1px solid #D6B66F;"
-                "border-radius:10px;padding:5px 10px;font-weight:700;"
-            )
+        set_status(
+            self.status_pill,
+            "KİLİT SAĞLAM" if reliable else "YENİDEN KAZANIM",
+            "success" if reliable else "warning",
+        )
         scores = data.get("scores", ())
         score_text = " / ".join(f"{float(score):.3f}" for score in scores)
         peak_margins = data.get("peak_margins", ())
@@ -671,18 +549,14 @@ class MissionControlWindow(QMainWindow):
         self.map_canvas.setAccessibleDescription(message)
         if level == "loading":
             self.loading_bar.show()
-            self.status_pill.setText("YÜKLENİYOR")
+            set_status(self.status_pill, "YÜKLENİYOR")
         elif level == "ready":
             self.loading_bar.hide()
-            self.status_pill.setText("HAZIR")
+            set_status(self.status_pill, "HAZIR")
 
     def _on_failed(self, traceback_text: str) -> None:
         self.loading_bar.hide()
-        self.status_pill.setText("HATA")
-        self.status_pill.setStyleSheet(
-            "background:#F3DDE1;color:#8A2E3C;border:1px solid #D59BA5;"
-            "border-radius:10px;padding:5px 10px;font-weight:700;"
-        )
+        set_status(self.status_pill, "HATA", "danger")
         summary = traceback_text.strip().splitlines()[-1] if traceback_text.strip() else "Bilinmeyen hata"
         self.map_canvas.setText(f"Simülasyon başlatılamadı\n{summary}")
         dialog = QMessageBox(self)
